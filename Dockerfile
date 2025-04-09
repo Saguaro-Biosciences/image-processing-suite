@@ -15,6 +15,7 @@ RUN pip install --upgrade pip setuptools wheel
 WORKDIR /home/ubuntu/image-processing-suite
 
 # Install Python dependencies
+COPY . .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Expose the port the app runs on (if applicable)
