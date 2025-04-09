@@ -10,10 +10,9 @@ RUN apt-get update && apt-get install -y \
 RUN pip install --upgrade pip setuptools wheel
 
 # Clone your repository
-RUN git clone https://github.com/youruser/yourrepo.git /home/ubuntu/yourrepo
 
 # Set working directory
-WORKDIR /home/ubuntu/yourrepo
+WORKDIR /home/ubuntu/image-processing-suite
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
