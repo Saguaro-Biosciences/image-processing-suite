@@ -96,7 +96,7 @@ def concatenate_csv_from_s3(bucket_name, plates,times, base_folder_path, output_
             # No need to read normalized_exp again
             csv_buffer = StringIO()
             normalized_exp.to_csv(csv_buffer, index=False)
-            output_key = f"{output_prefix}/{plate}/Normalized_features.csv"
+            output_key = f"{output_prefix}/{plate}/Normalized_features_{time}.csv"
             s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
             print(f"Saved to S3: s3://{output_bucket}/{output_key}")
 

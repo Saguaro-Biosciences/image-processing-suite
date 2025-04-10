@@ -3,12 +3,13 @@ import boto3
 import pandas as pd
 from io import StringIO
 import numpy as np
-from functools import reduce
-from pycytominer import annotate, normalize, feature_select
+from pycytominer import feature_select
 import pathlib
 from sklearn.metrics.pairwise import cosine_similarity
 import csv
 import os
+import pathlib
+import io
 
 k = 3
 alpha = 2.3538
@@ -26,7 +27,7 @@ def read_csv_from_s3(bucket_name, file_key):
 
     return pd.read_csv(StringIO(csv_content), sep=dialect.delimiter)
 
-def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, output_bucket, output_prefix, local_dir="temp_data"):
+def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, output_bucket, output_prefix,na_cutoff, corr_3hold,local_dir="temp_data"):
     """
     Concatenates and merges CSV files from an S3 bucket based on time points and image metadata.
     
@@ -43,49 +44,64 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, ou
     normalized_dfs = []
 
     for plate in plates:
-        print(f"Processing Plate: {plate}")
-        normalized_df = read_csv_from_s3(bucket_name, f"{base_folder_path}/{plate}/Normalized_features.csv")
-        if 'Metadata_Timepoint' not in normalized_df.columns: 
-            print("Adding Timepoint dataframe...")
-            normalized_df['Metadata_Timepoint'] = f"{plate}"
-        else:
-            print("Metadata_Timepoint present")
-        
-        # Append the normalized_df to the list
-        normalized_dfs.append(normalized_df)
+        print(f"Processing Plate folder: {plate}")
+        #reading every file onder the plate folder to get the normalized features
+        response = s3.list_objects_v2(Bucket=bucket_name, Prefix=f"{base_folder_path}/{plate}/")
+        matching_files = [
+        obj['Key'] for obj in response.get('Contents', []) if 'Normalized_features' in obj['Key']
+        ]
+        normalized_dfs = []
+        for file_key in matching_files:
+            df = read_csv_from_s3(bucket_name, file_key)
+            normalized_dfs.append(df)
 
-    # Concatenate all plates into one DataFrame
-    normalized_exp = pd.concat(normalized_dfs, ignore_index=True)
+        # Concatenate all plates into one DataFrame
+        normalized_exp = pd.concat(normalized_dfs, ignore_index=True)
 
-    feature_select_file = pathlib.Path(f"{local_dir}/normalized_cpfeature_select.csv")
-    feature_select_opts = ["variance_threshold", "drop_na_columns", "correlation_threshold", "drop_outliers"]
-    features = normalized_exp.columns[~normalized_exp.columns.str.contains("Metadata")].tolist()
+        feature_select_file = pathlib.Path(f"{local_dir}/normalized_cpfeature_select.csv")
+        feature_select_opts = ["variance_threshold", "drop_na_columns", "correlation_threshold", "drop_outliers"]
+        features = normalized_exp.columns[~normalized_exp.columns.str.contains("Metadata")].tolist()
+        # na_cutoff=0.05, corr_threshold=0.9
+        feature_select(
+            profiles=normalized_exp,
+            features=features,
+            samples="all",
+            na_cutoff=na_cutoff,
+            corr_threshold= corr_3hold,
+            operation=feature_select_opts,
+            output_file=feature_select_file,
+            output_type="csv"
+        )
     
-    feature_select(
-        profiles=normalized_exp,
-        features=features,
-        samples="all",
-        operation=feature_select_opts,
-        output_file=feature_select_file,
-        output_type="csv"
-    )
-    
-    normalized_exp_selected = pd.read_csv(feature_select_file)
-    csv_buffer = StringIO()
-    normalized_exp_selected.to_csv(csv_buffer, index=False)
-    output_key = f"{output_prefix}/CP_features_selected_alltp.csv"
-    s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
-    print(f"Saved to S3: s3://{output_bucket}/{output_key}")
+        normalized_exp_selected = pd.read_csv(feature_select_file)
+        if feature_select_file.exists():
+            feature_select_file.unlink()  # This deletes the file
+            print(f"Deleted local file: {feature_select_file}")
 
-    # Compute cosine similarities for each plate individually
-    averaged_similarities = []
-    similarities = []
+        csv_buffer = StringIO()
+        normalized_exp_selected.to_csv(csv_buffer, index=False)
+        output_key = f"{output_prefix}/CP_features_selected_allTimes_raw.csv"
+        s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
+        print(f"Saved to S3: s3://{output_bucket}/{output_key}")
+
+
+        normalized_exp_selected[features]=normalized_exp_selected[features].apply(double_sigmoid)
+        # Absolute value
+        normalized_exp_selected.loc[:,features]=normalized_exp_selected.loc[:,features].abs()
+        csv_buffer = StringIO()
+        normalized_exp_selected.to_csv(csv_buffer, index=False)
+        output_key = f"{output_prefix}/CP_features_selected_allTimes_dSig.csv"
+        s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
+        print(f"Saved to S3: s3://{output_bucket}/{output_key}")
+
+        # Compute cosine similarities for each plate individually
+        averaged_similarities = []
     
-    for plate in plates:
-        print(f"Cosine similarity Plate: {plate}")
+    
+        print(f"Processing cosine similarity")
         
         # Filter the selected data for the current plate
-        cpfeature_cos = normalized_exp_selected[normalized_exp_selected['Metadata_Timepoint'] == plate].drop(columns=['Metadata_Well','Metadata_Site'])
+        cpfeature_cos = normalized_exp_selected[normalized_exp_selected['Metadata_Timepoint'] == plate].drop(columns=['Metadata_Well'])
         
         for (compound_code, timepoint, compound_concentration) in cpfeature_cos[['Metadata_Compound', 'Metadata_Timepoint', 'Metadata_ConcLevel']].drop_duplicates().values:
             # Filter the data based on the unique combination of metadata values
@@ -121,21 +137,9 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, ou
                 'average_cosine_similarity': avg_similarity
             })
 
-            num_replicates = features.shape[0]
-            for i in range(num_replicates):
-                for j in range(i + 1, num_replicates):  # Upper triangle, excluding diagonal
-                    similarities.append({
-                        'Metadata_Compound': compound_code,
-                        'Metadata_Timepoint': timepoint,
-                        'Metadata_ConcLevel': compound_concentration,
-                        'Replicate_1': group.iloc[i].name,  # Store replicate index
-                        'Replicate_2': group.iloc[j].name,
-                        'cosine_similarity': pairwise_similarities[i, j]
-                    })
 
         # Convert the results into a DataFrame for the current plate
         df_averaged_similarities = pd.DataFrame(averaged_similarities)
-        df_similarities = pd.DataFrame(similarities)
 
         # Save Average_cosine_similarity to S3
         csv_buffer = StringIO()
@@ -143,16 +147,6 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, ou
         output_key = f"{output_prefix}/{plate}/Average_cosine_similarity.csv"
         s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
         print(f"Saved to S3: s3://{output_bucket}/{output_key}")
-
-        # Save Cosine_similarities to S3
-        csv_buffer = StringIO()
-        df_similarities.to_csv(csv_buffer, index=False)
-        output_key = f"{output_prefix}/{plate}/Cosine_similarities.csv"
-        s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
-        print(f"Saved to S3: s3://{output_bucket}/{output_key}")
-
-    #    )
-
 
 if __name__ == "__main__":
 
@@ -162,6 +156,8 @@ if __name__ == "__main__":
     parser.add_argument("--bucket_name", required=True, help="S3 bucket containing the files.")
     parser.add_argument("--base_folder", required=True, help="Base folder path in S3 where experiment folders are stored.")
     parser.add_argument("--plates", nargs="+", required=True, help="List of plates list to process (prefix as they are from CP Feature extraction).")
+    parser.add_argument("--na_cutoff", default=0.5, help="Absent value threshold for feature selection.")
+    parser.add_argument("--corr_3hold", default=0.9, help="Correlation threshold for feature selection.")
     parser.add_argument("--output_bucket", required=True, help="S3 bucket where output files will be saved.")
     parser.add_argument("--output_prefix", required=True, help="Prefix for the output files in S3.")
     parser.add_argument("--local_dir", default="temp_data", help="Local directory for temporary storage.")
@@ -173,6 +169,8 @@ if __name__ == "__main__":
         bucket_name=args.bucket_name,  # cellprofiler-resuts
         base_folder_path=args.base_folder, # IRIC/CQDM_CTL_Plate_Validation_202501/Plate_1
         plates= args.plates,
+        na_cutoff=int(args.na_cutoff),
+        corr_3hold=int(args.corr_3hold),
         output_bucket=args.output_bucket, #cellprofiler-resuts
         output_prefix=args.output_prefix, # CQDM/CTL_Plate/Plate_1
         local_dir=args.local_dir # Plate_1
