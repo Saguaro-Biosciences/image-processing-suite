@@ -8,6 +8,7 @@ from pycytominer import annotate, normalize, feature_select
 import pathlib
 from sklearn.metrics.pairwise import cosine_similarity
 import csv
+import os
 
 def concatenate_csv_from_s3(bucket_name, base_folder_path, output_bucket, output_prefix, local_dir="temp_data"):
     """
