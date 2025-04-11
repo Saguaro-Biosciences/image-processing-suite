@@ -27,7 +27,7 @@ def read_csv_from_s3(bucket_name, file_key):
 
     return pd.read_csv(StringIO(csv_content), sep=dialect.delimiter)
 
-def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, output_bucket, output_prefix,na_cutoff, corr_3hold,local_dir="temp_data"):
+def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path,per_time, output_bucket, output_prefix,na_cutoff, corr_3hold,local_dir="temp_data"):
     """
     Concatenates and merges CSV files from an S3 bucket based on time points and image metadata.
     
@@ -57,26 +57,51 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, ou
 
         # Concatenate all plates into one DataFrame
         normalized_exp = pd.concat(normalized_dfs, ignore_index=True)
+        if per_time:
+            print("Performing feature selection per timepoint...")
+            all_timepoints_selected = []
 
-        feature_select_file = pathlib.Path(f"{local_dir}/normalized_cpfeature_select.csv")
-        feature_select_opts = ["variance_threshold", "drop_na_columns", "correlation_threshold", "drop_outliers"]
-        features = normalized_exp.columns[~normalized_exp.columns.str.contains("Metadata")].tolist()
-        # na_cutoff=0.05, corr_threshold=0.9
-        feature_select(
-            profiles=normalized_exp,
-            features=features,
-            samples="all",
-            na_cutoff=na_cutoff,
-            corr_threshold= corr_3hold,
-            operation=feature_select_opts,
-            output_file=feature_select_file,
-            output_type="csv"
-        )
-    
-        normalized_exp_selected = pd.read_csv(feature_select_file)
-        if feature_select_file.exists():
-            feature_select_file.unlink()  # This deletes the file
-            print(f"Deleted local file: {feature_select_file}")
+            for timepoint in normalized_exp["Metadata_Timepoint"].unique():
+                df_time = normalized_exp[normalized_exp["Metadata_Timepoint"] == timepoint]
+                features = df_time.columns[~df_time.columns.str.contains("Metadata")].tolist()
+
+                feature_select_file = pathlib.Path(f"{local_dir}/normalized_cpfeature_select_{timepoint}.csv")
+                feature_select(
+                    profiles=df_time,
+                    features=features,
+                    samples="all",
+                    na_cutoff=na_cutoff,
+                    corr_threshold=corr_3hold,
+                    operation=feature_select_opts,
+                    output_file=feature_select_file,
+                    output_type="csv"
+                )
+
+                df_selected = pd.read_csv(feature_select_file)
+                df_selected["Metadata_Timepoint"] = timepoint  # Keep metadata
+                all_timepoints_selected.append(df_selected)
+                feature_select_file.unlink()
+
+            normalized_exp_selected = pd.concat(all_timepoints_selected, ignore_index=True)
+
+        elif not per_time:
+            feature_select_file = pathlib.Path(f"{local_dir}/normalized_cpfeature_select.csv")
+            feature_select_opts = ["variance_threshold", "drop_na_columns", "correlation_threshold", "drop_outliers"]
+            features = normalized_exp.columns[~normalized_exp.columns.str.contains("Metadata")].tolist()
+            # na_cutoff=0.05, corr_threshold=0.9
+            feature_select(
+                profiles=normalized_exp,
+                features=features,
+                samples="all",
+                na_cutoff=na_cutoff,
+                corr_threshold= corr_3hold,
+                operation=feature_select_opts,
+                output_file=feature_select_file,
+                output_type="csv"
+            )
+        
+            normalized_exp_selected = pd.read_csv(feature_select_file)
+            feature_select_file.unlink()
 
         csv_buffer = StringIO()
         normalized_exp_selected.to_csv(csv_buffer, index=False)
@@ -156,8 +181,9 @@ if __name__ == "__main__":
     parser.add_argument("--bucket_name", required=True, help="S3 bucket containing the files.")
     parser.add_argument("--base_folder", required=True, help="Base folder path in S3 where experiment folders are stored.")
     parser.add_argument("--plates", nargs="+", required=True, help="List of plates list to process (prefix as they are from CP Feature extraction).")
-    parser.add_argument("--na_cutoff", default=0.5, help="Absent value threshold for feature selection.")
-    parser.add_argument("--corr_3hold", default=0.9, help="Correlation threshold for feature selection.")
+    parser.add_argument("--na_cutoff", type=float,default=0.5, help="Absent value threshold for feature selection.")
+    parser.add_argument("--corr_3hold", type=float,default=0.9, help="Correlation threshold for feature selection.")
+    parser.add_argument("--per_time", action='store_true', help="Performes feature selection per time point.")
     parser.add_argument("--output_bucket", required=True, help="S3 bucket where output files will be saved.")
     parser.add_argument("--output_prefix", required=True, help="Prefix for the output files in S3.")
     parser.add_argument("--local_dir", default="temp_data", help="Local directory for temporary storage.")
@@ -169,19 +195,10 @@ if __name__ == "__main__":
         bucket_name=args.bucket_name,  # cellprofiler-resuts
         base_folder_path=args.base_folder, # IRIC/CQDM_CTL_Plate_Validation_202501/Plate_1
         plates= args.plates,
-        na_cutoff=int(args.na_cutoff),
-        corr_3hold=int(args.corr_3hold),
+        na_cutoff=args.na_cutoff,
+        corr_3hold=args.corr_3hold,
+        per_time=args.per_time,
         output_bucket=args.output_bucket, #cellprofiler-resuts
         output_prefix=args.output_prefix, # CQDM/CTL_Plate/Plate_1
         local_dir=args.local_dir # Plate_1
     )
-
-    #for plate in args.exp_ids:
-    #    print(f"Processing Plate {plate}...")
-    #    concatenate_csv_from_s3(
-    #        bucket_name=args.bucket_name,
-    #        base_folder_path=f"{args.base_folder}/Plate_{plate}",
-    #        output_bucket=args.output_bucket,
-    #        output_prefix=f"{args.output_prefix}/{plate}",
-    #        local_dir=args.local_dir
-    #    )
