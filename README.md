@@ -85,3 +85,18 @@ response = ssm.send_command(
     }
 )
 ```
+
+All of the codes relly in the general structure of the results where for a given project:
+
+```
+📦 bucket/
+├── 📁 project_1/
+│   ├── 📁 Plate_1/
+│   │   ├── 📁 0h/
+│   │   │   └── results.csv
+│   │   ├── 📁 12h/
+│   │   └── 📁 24h/
+│   └── 📁 Plate_2/
+├── 📁 project_2/
+...
+```
