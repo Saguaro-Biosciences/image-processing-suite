@@ -106,7 +106,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_bucket",type=str, required=True, help="S3 bucket where output files will be saved.")
     parser.add_argument("--output_prefix", type=str,required=True, help="Prefix for the output files in S3.")
     parser.add_argument("--well_agg_func",type=str, default="mean", help="Function to aggregate at well level. Default mean.")
-    parser.add_argument("--no_time_subFolder",type=str, action='store_true')
+    parser.add_argument("--no_time_subFolder", action='store_true')
 
     args = parser.parse_args()
     logger.info(f"Starting normalization for base folder: {args.base_folder}")
