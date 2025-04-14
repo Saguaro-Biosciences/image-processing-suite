@@ -25,7 +25,7 @@ def read_csv_from_s3(bucket_name, file_key):
     dialect = csv.Sniffer().sniff(sample, delimiters=";,")
     return pd.read_csv(StringIO(csv_content), sep=dialect.delimiter)
 
-def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output_bucket, DMSO, output_prefix, well_agg_func):
+def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output_bucket, DMSO, output_prefix, well_agg_func,no_time_subFolder):
     s3 = boto3.client('s3')
 
     for plate in plates:
@@ -45,7 +45,10 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
             tables = {}
 
             for name in table_info:
-                file_key = f"{base_folder_path}/{plate}/{time}/{name}.csv"
+                if not no_time_subFolder:
+                    file_key = f"{base_folder_path}/{plate}/{time}/{name}.csv"
+                elif no_time_subFolder:
+                    file_key = f"{base_folder_path}/{plate}/{name}.csv"
                 df = read_csv_from_s3(bucket_name, file_key)
 
                 if 'Metadata_Well' not in df.columns:
@@ -98,11 +101,12 @@ if __name__ == "__main__":
     parser.add_argument("--bucket_name", type=str,required=True, help="S3 bucket containing the files.")
     parser.add_argument("--base_folder",type=str, required=True, help="Base folder path in S3 where experiment folders are stored.")
     parser.add_argument("--plates", nargs="+", required=True, help="List of plates list to process (prefix Plate/Time/csv).")
-    parser.add_argument("--times", nargs="+", required=True, help="List of times to process (prefix Plate/Time/csv).")
+    parser.add_argument("--times", nargs="+", help="List of times to process (prefix Plate/Time/csv).")
     parser.add_argument("--DMSO", type=str,default="DMSO", help="DMSO nomenclature used to normalize in the plateMap.")
     parser.add_argument("--output_bucket",type=str, required=True, help="S3 bucket where output files will be saved.")
     parser.add_argument("--output_prefix", type=str,required=True, help="Prefix for the output files in S3.")
     parser.add_argument("--well_agg_func",type=str, default="mean", help="Function to aggregate at well level. Default mean.")
+    parser.add_argument("--no_time_subFolder",type=str, action='store_true')
 
     args = parser.parse_args()
     logger.info(f"Starting normalization for base folder: {args.base_folder}")
@@ -112,6 +116,7 @@ if __name__ == "__main__":
         base_folder_path=args.base_folder,
         plates=args.plates,
         times=args.times,
+        no_time_subFolder= args.no_time_subFolder,
         DMSO=args.DMSO,
         output_bucket=args.output_bucket,
         output_prefix=args.output_prefix,
