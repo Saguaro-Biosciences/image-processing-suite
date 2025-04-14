@@ -1,5 +1,6 @@
 import argparse
 import boto3
+from botocore.config import Config
 import pandas as pd
 from io import StringIO
 import numpy as np
@@ -15,8 +16,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def read_csv_from_s3(bucket_name, file_key):
-    s3 = boto3.client('s3')
+custom_config = Config(
+connect_timeout=30,  # Time to establish connection
+read_timeout=300     # Time to wait for data (increase as needed)
+)
+s3 = boto3.client('s3', config=custom_config)
+
+def read_csv_from_s3(bucket_name, file_key,s3):
     logger.info(f"Reading CSV from s3://{bucket_name}/{file_key}")
     response = s3.get_object(Bucket=bucket_name, Key=file_key)
     csv_content = response['Body'].read().decode('utf-8')
