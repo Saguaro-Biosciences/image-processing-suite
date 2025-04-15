@@ -104,7 +104,7 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, pe
 
         csv_buffer = StringIO()
         normalized_exp_selected.to_csv(csv_buffer, index=False)
-        output_key = f"{output_prefix}/CP_features_selected_allTimes_raw.csv"
+        output_key = f"{output_prefix}/{plate}/CP_features_selected_allTimes_raw.csv"
         s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
         logger.info(f"Saved raw selected features to s3://{output_bucket}/{output_key}")
 
@@ -112,7 +112,7 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, pe
         normalized_exp_selected[features] = normalized_exp_selected[features].apply(double_sigmoid).abs()
         csv_buffer = StringIO()
         normalized_exp_selected.to_csv(csv_buffer, index=False)
-        output_key = f"{output_prefix}/CP_features_selected_allTimes_dSig.csv"
+        output_key = f"{output_prefix}/{plate}/CP_features_selected_allTimes_dSig.csv"
         s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
         logger.info(f"Saved double sigmoid transformed features to s3://{output_bucket}/{output_key}")
 
