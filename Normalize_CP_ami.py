@@ -26,7 +26,7 @@ def read_csv_from_s3(bucket_name, file_key,s3):
     dialect = csv.Sniffer().sniff(sample, delimiters=";,")
     return pd.read_csv(StringIO(csv_content), sep=dialect.delimiter)
 
-def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output_bucket, DMSO, output_prefix, well_agg_func,no_time_subFolder):
+def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output_bucket, DMSO, platemap,output_prefix, well_agg_func,no_time_subFolder):
     custom_config = Config(
     connect_timeout=30,  # Time to establish connection
     read_timeout=300     # Time to wait for data (increase as needed)
@@ -35,7 +35,7 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
 
     for plate in plates:
         logger.info(f"Processing plate ID: {plate}")
-        filtered_plateMap = read_csv_from_s3(bucket_name, f"{base_folder_path}/{plate}_PlateMap.csv",s3) # plate map 
+        filtered_plateMap = read_csv_from_s3(bucket_name, f"{base_folder_path}/{platemap}",s3) # plate map 
 
         for time in times:
             logger.info(f"Processing timepoint: {time}")
@@ -108,6 +108,7 @@ if __name__ == "__main__":
     parser.add_argument("--plates", nargs="+", required=True, help="List of plates list to process (prefix Plate/Time/csv).")
     parser.add_argument("--times", nargs="+", help="List of times to process (prefix Plate/Time/csv).")
     parser.add_argument("--DMSO", type=str,default="DMSO", help="DMSO nomenclature used to normalize in the plateMap.")
+    parser.add_argument("--platemap", type=str,required=True, help="plateMap key.")
     parser.add_argument("--output_bucket",type=str, required=True, help="S3 bucket where output files will be saved.")
     parser.add_argument("--output_prefix", type=str,required=True, help="Prefix for the output files in S3.")
     parser.add_argument("--well_agg_func",type=str, default="mean", help="Function to aggregate at well level. Default mean.")
@@ -123,6 +124,7 @@ if __name__ == "__main__":
         times=args.times,
         no_time_subFolder= args.no_time_subFolder,
         DMSO=args.DMSO,
+        platemap=args.platemap,
         output_bucket=args.output_bucket,
         output_prefix=args.output_prefix,
         well_agg_func=args.well_agg_func
