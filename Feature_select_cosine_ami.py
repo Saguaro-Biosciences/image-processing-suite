@@ -108,6 +108,7 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, pe
         s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
         logger.info(f"Saved raw selected features to s3://{output_bucket}/{output_key}")
 
+        features = normalized_exp_selected.columns[~normalized_exp_selected.columns.str.contains("Metadata")].tolist()
         normalized_exp_selected[features] = normalized_exp_selected[features].apply(double_sigmoid).abs()
         csv_buffer = StringIO()
         normalized_exp_selected.to_csv(csv_buffer, index=False)
