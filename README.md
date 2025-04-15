@@ -9,19 +9,11 @@ This code allows you to launch an EC2 instance and run the image processing tool
 ```python
 import boto3
 
-# Initialize AWS clients
-s3 = boto3.client('s3')
-ec2 = boto3.client('ec2')
-ssm = boto3.client('ssm')
-
-instances = []
-
-# Run EC2 instance
 response = ec2.run_instances(
-    ImageId='ami-053b0d53c279acc90',  # Ubuntu core image
+    ImageId='ami-06c62cd5979834f62',  # Ubuntu core image + RAM monitor
     MinCount=1,
     MaxCount=1,  # Launch n instances
-    InstanceType='t3.2xlarge',
+    InstanceType='r5a.2xlarge',
     IamInstanceProfile={
         'Name': "ssmmmanager"  # Specify the IAM role name
     },
@@ -38,6 +30,7 @@ response = ec2.run_instances(
     }],
     UserData="""#!/bin/bash
                 # Update package list and install Docker
+                sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
                 sudo apt-get update
                 sudo apt-get install -y docker.io git
 
@@ -46,22 +39,21 @@ response = ec2.run_instances(
 
                 # Navigate to the repo directory
                 cd /home/ubuntu/image-processing-suite          
-
+                git checkout dev
+                
                 # Build the Docker image
                 sudo docker build -t image-processing-suite .
 
                 # Run the Docker container
                 sudo docker run -dit --name pycyto_container image-processing-suite
-                sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
     """,  # This is the UserData script
     TagSpecifications=[
         {
             'ResourceType': 'instance',
-            'Tags': [{'Key': 'Name', 'Value': "GitPycy "}]
+            'Tags': [{'Key': 'Name', 'Value': "GitPycy5"}]
         }
     ]
 )
-
 ```
 
 ## Running Commands on EC2 Using SSM
