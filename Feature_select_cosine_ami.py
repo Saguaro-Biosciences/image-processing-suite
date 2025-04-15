@@ -120,7 +120,7 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, pe
         averaged_similarities = []
         logger.info("Computing cosine similarities...")
 
-        cpfeature_cos = normalized_exp_selected[normalized_exp_selected['Metadata_Timepoint'] == plate].drop(columns=['Metadata_Well'])
+        cpfeature_cos=normalized_exp_selected.drop(columns=['Metadata_Plate','Metadata_Well'])
 
         for (compound_code, timepoint, compound_concentration) in cpfeature_cos[['Metadata_Compound', 'Metadata_Timepoint', 'Metadata_ConcLevel']].drop_duplicates().values:
             group = cpfeature_cos[
