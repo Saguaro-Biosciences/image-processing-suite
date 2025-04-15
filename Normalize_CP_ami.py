@@ -16,11 +16,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-custom_config = Config(
-connect_timeout=30,  # Time to establish connection
-read_timeout=300     # Time to wait for data (increase as needed)
-)
-s3 = boto3.client('s3', config=custom_config)
 
 def read_csv_from_s3(bucket_name, file_key,s3):
     logger.info(f"Reading CSV from s3://{bucket_name}/{file_key}")
@@ -32,11 +27,15 @@ def read_csv_from_s3(bucket_name, file_key,s3):
     return pd.read_csv(StringIO(csv_content), sep=dialect.delimiter)
 
 def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output_bucket, DMSO, output_prefix, well_agg_func,no_time_subFolder):
-    s3 = boto3.client('s3')
+    custom_config = Config(
+    connect_timeout=30,  # Time to establish connection
+    read_timeout=300     # Time to wait for data (increase as needed)
+    )
+    s3 = boto3.client('s3', config=custom_config)
 
     for plate in plates:
         logger.info(f"Processing plate ID: {plate}")
-        filtered_plateMap = read_csv_from_s3(bucket_name, f"{base_folder_path}/{plate}_PlateMap.csv")
+        filtered_plateMap = read_csv_from_s3(bucket_name, f"{base_folder_path}/{plate}_PlateMap.csv",s3)
 
         for time in times:
             logger.info(f"Processing timepoint: {time}")
