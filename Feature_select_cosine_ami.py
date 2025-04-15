@@ -164,7 +164,7 @@ if __name__ == "__main__":
     parser.add_argument("--plates", nargs="+", required=True)
     parser.add_argument("--na_cutoff", type=float, default=0.5)
     parser.add_argument("--corr_3hold", type=float, default=0.9)
-    parser.add_argument("--per_time",type=str, action='store_true')
+    parser.add_argument("--per_time", action='store_true')
     parser.add_argument("--output_bucket", type=str,required=True)
     parser.add_argument("--output_prefix", type=str,required=True)
     parser.add_argument("--local_dir", type=str,default="temp_data")
