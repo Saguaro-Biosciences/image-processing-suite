@@ -43,7 +43,7 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, pe
 
     for plate in plates:
         logger.info(f"Processing plate folder: {plate}")
-        response = s3.list_objects_v2(Bucket=bucket_name, Prefix=f"{base_folder_path}/{plate}/")
+        response = s3.list_objects_v2(Bucket=bucket_name, Prefix=f"{base_folder_path}/{plate}")
         matching_files = [obj['Key'] for obj in response.get('Contents', []) if 'Normalized_features' in obj['Key']]
         logger.info(f"Found {len(matching_files)} normalized feature files for plate {plate}")
 
