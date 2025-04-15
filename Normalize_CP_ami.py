@@ -35,7 +35,7 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
 
     for plate in plates:
         logger.info(f"Processing plate ID: {plate}")
-        filtered_plateMap = read_csv_from_s3(bucket_name, f"{base_folder_path}/{plate}_PlateMap.csv",s3)
+        filtered_plateMap = read_csv_from_s3(bucket_name, f"{base_folder_path}/{plate}_PlateMap.csv",s3) # plate map 
 
         for time in times:
             logger.info(f"Processing timepoint: {time}")
@@ -54,7 +54,7 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
                     file_key = f"{base_folder_path}/{plate}/{time}/{name}.csv"
                 elif no_time_subFolder:
                     file_key = f"{base_folder_path}/{plate}/{name}.csv"
-                df = read_csv_from_s3(bucket_name, file_key)
+                df = read_csv_from_s3(bucket_name, file_key,s3)
 
                 if 'Metadata_Well' not in df.columns:
                     logger.error(f"Missing 'Metadata_Well' in {file_key}")
