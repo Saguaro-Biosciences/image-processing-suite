@@ -133,8 +133,7 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Bioactivity Analysis with Venn Diagrams and Heatmaps.")
     parser.add_argument("--bucket_name", required=True, help="S3 bucket with feature and platemap files.")
-    parser.add_argument("--features_key", required=True, help="S3 key to the normalized feature CSV.")
-    parser.add_argument("--plate_map_key", required=True, help="S3 key to the plate map CSV.")
+    parser.add_argument("--features_key", required=True, help="S3 key to the normalized selected feature CSV.")
     parser.add_argument("--bioactive_threshold_quantile", type=float, default=0.95, help="Quantile threshold for ZPE/DMSO induction.")
     parser.add_argument("--induction_threshold", type=float, default=0.95, help="Threshold to consider a feature induced.")
     parser.add_argument("--output_prefix", required=True, help="S3 prefix where output images will be saved.")
@@ -144,7 +143,6 @@ if __name__ == "__main__":
     main(
         bucket_name=args.bucket_name,
         features_key=args.features_key,
-        plate_map_key=args.plate_map_key,
         bioactive_threshold_quantile=args.bioactive_threshold_quantile,
         induction_threshold=args.induction_threshold,
         output_prefix=args.output_prefix,
