@@ -87,8 +87,8 @@ def main(
     bioactive_compounds = set(compound_bioactivity.loc[compound_bioactivity["Bioactive"] == 1, "Metadata_Compound"])
 
     # Venn 1: All compounds vs Bioactive compounds
-    plt.figure(figsize=(5, 5))
-    venn2([all_compounds, bioactive_compounds], set_labels=("All Compounds", f"Bioactive {len(bioactive_compounds)/len(all_compounds)*100}%"))
+    plt.figure(figsize=(8, 5))
+    venn2([all_compounds, bioactive_compounds], set_labels=("All Compounds", f"Bioactive {int(len(bioactive_compounds)/len(all_compounds)*100)}%"))
     plt.title("Bioactivity Overview")
     venn_all_vs_bioactive = "venn_all_vs_bioactive.png"
     plt.savefig(venn_all_vs_bioactive)
@@ -107,8 +107,8 @@ def main(
             ]
         )
         
-        plt.figure(figsize=(6, 6))
-        venn2([bioactive_compounds, tp48_induction], set_labels=("All Bioactive", "48h Bioactive"))
+        plt.figure(figsize=(8, 6))
+        venn2([all_compounds, tp48_induction], set_labels=("All Bioactive", f"48h Bioactive {int(len(tp48_induction)/len(all_compounds)*100)}%"))
         plt.title("Bioactive Compounds at 48h vs All Timepoints")
         venn_48_vs_allbio = "venn_48_vs_allbio.png"
         plt.savefig(venn_48_vs_allbio)
@@ -124,7 +124,7 @@ def main(
     )
 
     # Set up the figure
-    plt.figure(figsize=(heatmap_data.shape[1], max(6, len(heatmap_data) * 0.3)))
+    plt.figure(figsize=(5, max(6, len(heatmap_data) * 0.3)))
     sns.heatmap(
         heatmap_data,
         cmap=sns.color_palette(["lightgrey", "black"]),  # grey for 0, red for 1
