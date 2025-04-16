@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib_venn import venn2
+import matplotlib.patches as mpatches
 import seaborn as sns
 import boto3
 import csv
@@ -39,6 +40,7 @@ def main(
     sig = read_csv_from_s3(bucket_name, features_key)
 
     non_metadata_cols = [col for col in sig.columns if not col.startswith("Metadata_")]
+    logger.info(f"Total feature col to account: {len(non_metadata_cols)}")
     sig["induction"] = (sig[non_metadata_cols] > induction_threshold).sum(axis=1) / len(non_metadata_cols)
 
     sig_ind = sig[[
@@ -65,29 +67,24 @@ def main(
 
     # Bioactivity analysis
     ind_mean = (
-        sig_ind[sig_ind["Metadata_Compound"] != f"{DMSO}"]
-        .groupby(["Metadata_Timepoint", "Metadata_Compound", "Metadata_ConcLevel"])
-        .agg(induction_mean=("induction", "mean"))
-        .reset_index()
+    sig_ind[sig_ind["Metadata_Compound"] != f"{DMSO}"]
+    .groupby(["Metadata_Timepoint", "Metadata_Compound", "Metadata_ConcLevel"])
+    .agg(induction_mean=("induction", "mean"))
+    .reset_index()
     )
 
-    wide = ind_mean.pivot(index=["Metadata_Timepoint", "Metadata_Compound"],
-                          columns="Metadata_ConcLevel",
-                          values="induction_mean").reset_index()
-
-    wide["bioactivity"] = (wide.iloc[:, 2:] >= bioactive_threshold).any(axis=1).astype(int)
-
-    wide_tp = wide.pivot(index="Metadata_Compound",
-                         columns="Metadata_ConcLevel",
-                         values="bioactivity").reset_index()
-
-    wide_tp["Bioactive"] = (wide_tp.iloc[:, 1:] > 0).any(axis=1).astype(int)
+    ind_mean["Bioactive"] = (ind_mean["induction_mean"] >= bioactive_threshold).astype(int)
+    compound_bioactivity = (
+        ind_mean.groupby(["Metadata_Timepoint", "Metadata_Compound"])["Bioactive"]
+        .max()
+        .reset_index()
+    )
 
     logger.info("Generating Venn diagrams")
 
     # All compound codes
-    all_compounds = set(wide_tp["Metadata_Compound"])
-    bioactive_compounds = set(wide_tp.loc[wide_tp["Bioactive"] == 1, "Metadata_Compound"])
+    all_compounds = set(compound_bioactivity["Metadata_Compound"])
+    bioactive_compounds = set(compound_bioactivity.loc[compound_bioactivity["Bioactive"] == 1, "Metadata_Compound"])
 
     # Venn 1: All compounds vs Bioactive compounds
     plt.figure(figsize=(5, 5))
@@ -99,10 +96,10 @@ def main(
     upload_image_to_s3(bucket_name, f"{output_prefix}/venn_all_vs_bioactive.png", venn_all_vs_bioactive)
 
     # Identify 48h column (int 48, or '48', or '15' fallback)
-    tp48_col = next((col for col in wide_tp.columns if str(col) in ["48", "48h", "15"]), None)
+    tp48_col = next((h for h in compound_bioactivity.Metadata_Timepoint.unique().tolist() if str(h) in ["48", "48h", "15"]), None)
     
     if tp48_col:
-        tp48_induction = set(wide_tp.loc[wide_tp[tp48_col] == 1, "Metadata_Compound"])
+        tp48_induction = set(compound_bioactivity.loc[compound_bioactivity[tp48_col] == 1, "Metadata_Compound"])
 
         plt.figure(figsize=(6, 6))
         venn2([bioactive_compounds, tp48_induction], set_labels=("All Bioactive", "48h Bioactive"))
@@ -112,23 +109,47 @@ def main(
         plt.close()
         upload_image_to_s3(bucket_name, f"{output_prefix}/venn_48_vs_allbio.png", venn_48_vs_allbio)
 
-    heatmap_img = "bioactivity_heatmap.png"
-    heatmap_df.set_index("Metadata_Compound", inplace=True)
-    heatmap_df = heatmap_df.sort_index()
+    
+    logger.info("Performing heatmap.")
+    heatmap_data = compound_bioactivity.pivot(
+        index="Metadata_Compound",
+        columns="Metadata_Timepoint",
+        values="Bioactive"
+    )
 
-    logger.info("Plotting bioactivity heatmap")
-    plt.figure(figsize=(12, max(6, 0.4 * len(heatmap_df))))
-    ax = sns.heatmap(heatmap_df, cmap="gray_r", linewidths=0.5, cbar_kws={"ticks": [0, 1]})
-    colorbar = ax.collections[0].colorbar
-    colorbar.set_ticks([0, 1])
-    colorbar.set_ticklabels(["Inactive", "Active"])
-    plt.xlabel("Time Points")
-    plt.ylabel("Compounds")
-    plt.title("Binary Heatmap of Compound Bioactivity Over Time")
+    # Set up the figure
+    plt.figure(figsize=(heatmap_data.shape[1], max(6, len(heatmap_data) * 0.3)))
+    sns.heatmap(
+        heatmap_data,
+        cmap=sns.color_palette(["lightgrey", "black"]),  # grey for 0, red for 1
+        linewidths=0.5,
+        linecolor='black',
+        cbar=False,
+        annot=True,
+        fmt='d'
+    )
+
+    # Add a custom legend
+    plt.title("Compound Bioactivity by Timepoint")
+    plt.xlabel("Timepoint")
+    plt.ylabel("Compound")
+
+    active_patch = mpatches.Patch(color='black', label='Active')
+    inactive_patch = mpatches.Patch(facecolor='lightgrey', edgecolor='black', label='Inactive')
+    plt.legend(
+        handles=[active_patch, inactive_patch],
+        title="Legend",
+        loc='upper left',
+        bbox_to_anchor=(-2.8, 1),  # slightly above and to the left of the plot
+        frameon=False  # optional: remove box around the legend
+    )
+
     plt.tight_layout()
-    plt.savefig(heatmap_img)
+    bioheat_img = "compound_bioactivity_heatmap.png"
+    plt.savefig(bioheat_img)
     plt.close()
-    upload_image_to_s3(bucket_name, f"{output_prefix}/bioactivity_heatmap.png", heatmap_img)
+
+    upload_image_to_s3(bucket_name, f"{output_prefix}/compound_bioactivity_heatmap.png", bioheat_img)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Bioactivity Analysis with Venn Diagrams and Heatmaps.")
