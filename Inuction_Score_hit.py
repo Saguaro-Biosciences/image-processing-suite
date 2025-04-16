@@ -102,7 +102,7 @@ def main(
         tp48_induction = set(
             compound_bioactivity.loc[
                 (compound_bioactivity["Metadata_Timepoint"] == tp48_col) & 
-                (compound_bioactivity["bioactive"] == 1),
+                (compound_bioactivity["Bioactive"] == 1),
                 "Metadata_Compound"
             ]
         )
