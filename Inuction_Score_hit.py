@@ -124,7 +124,7 @@ def main(
     )
 
     # Set up the figure
-    plt.figure(figsize=(5, max(6, len(heatmap_data) * 0.3)))
+    plt.figure(figsize=(heatmap_data.shape[1], max(6, len(heatmap_data) * 0.3)))
     sns.heatmap(
         heatmap_data,
         cmap=sns.color_palette(["lightgrey", "black"]),  # grey for 0, red for 1
@@ -139,16 +139,6 @@ def main(
     plt.title("Compound Bioactivity by Timepoint")
     plt.xlabel("Timepoint")
     plt.ylabel("Compound")
-
-    active_patch = mpatches.Patch(color='black', label='Active')
-    inactive_patch = mpatches.Patch(facecolor='lightgrey', edgecolor='black', label='Inactive')
-    plt.legend(
-        handles=[active_patch, inactive_patch],
-        title="Legend",
-        loc='upper left',
-        bbox_to_anchor=(-2.8, 1),  # slightly above and to the left of the plot
-        frameon=False  # optional: remove box around the legend
-    )
 
     #plt.tight_layout()
     bioheat_img = "compound_bioactivity_heatmap.png"
