@@ -4,6 +4,7 @@ numpy==1.24.1
 pycytominer
 matplotlib==3.6.3
 matplotlib-venn
+seaborn
 scikit-learn==1.0.2
 umap-learn==0.5.2
 plotly==5.11.0
