@@ -59,7 +59,7 @@ def main(
     plt.xlabel("Induction")
     plt.ylabel("Frequency")
     plt.axvline(x=bioactive_threshold, color="red", linestyle="dashed", linewidth=2, label=f"Threshold {bioactive_threshold:.2f}")
-    plt.title("Distribution of ZPE Induction Score")
+    plt.title(f"Distribution of ZPE Induction Score (Feature n = {len(non_metadata_cols)})")
     plt.legend()
     plt.savefig(dist_img)
     plt.close()
