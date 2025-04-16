@@ -88,7 +88,7 @@ def main(
 
     # Venn 1: All compounds vs Bioactive compounds
     plt.figure(figsize=(5, 5))
-    venn2([all_compounds, bioactive_compounds], set_labels=("All Compounds", "Bioactive"))
+    venn2([all_compounds, bioactive_compounds], set_labels=("All Compounds", f"Bioactive {len(bioactive_compounds)/len(all_compounds)*100}%"))
     plt.title("Bioactivity Overview")
     venn_all_vs_bioactive = "venn_all_vs_bioactive.png"
     plt.savefig(venn_all_vs_bioactive)
@@ -99,8 +99,14 @@ def main(
     tp48_col = next((h for h in compound_bioactivity.Metadata_Timepoint.unique().tolist() if str(h) in ["48", "48h", "15"]), None)
     
     if tp48_col:
-        tp48_induction = set(compound_bioactivity.loc[compound_bioactivity[tp48_col] == 1, "Metadata_Compound"])
-
+        tp48_induction = set(
+            compound_bioactivity.loc[
+                (compound_bioactivity["Metadata_Timepoint"] == tp48_col) & 
+                (compound_bioactivity["bioactive"] == 1),
+                "Metadata_Compound"
+            ]
+        )
+        
         plt.figure(figsize=(6, 6))
         venn2([bioactive_compounds, tp48_induction], set_labels=("All Bioactive", "48h Bioactive"))
         plt.title("Bioactive Compounds at 48h vs All Timepoints")
