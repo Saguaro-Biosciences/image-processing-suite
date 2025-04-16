@@ -124,7 +124,7 @@ def main(
     )
 
     # Set up the figure
-    plt.figure(figsize=(6, min(20, 0.2 * len(heatmap_data))))
+    plt.figure(figsize=(10, min(20, 0.2 * len(heatmap_data))))
     sns.heatmap(
         heatmap_data,
         cmap=sns.color_palette(["lightgrey", "black"]),
