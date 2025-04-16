@@ -150,7 +150,7 @@ def main(
         frameon=False  # optional: remove box around the legend
     )
 
-    plt.tight_layout()
+    #plt.tight_layout()
     bioheat_img = "compound_bioactivity_heatmap.png"
     plt.savefig(bioheat_img)
     plt.close()
