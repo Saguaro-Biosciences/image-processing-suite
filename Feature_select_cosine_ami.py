@@ -40,14 +40,13 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, pe
     s3 = boto3.client('s3')
     os.makedirs(local_dir, exist_ok=True)
     logger.info(f"Local directory created or exists: {local_dir}")
-
+    normalized_dfs = []
     for plate in plates:
         logger.info(f"Processing plate folder: {plate}")
         response = s3.list_objects_v2(Bucket=bucket_name, Prefix=f"{base_folder_path}/{plate}/",Delimiter='/')
         matching_files = [obj['Key'] for obj in response.get('Contents', []) if 'Normalized_features' in obj['Key']]
         logger.info(f"Found {len(matching_files)} normalized feature files for plate {plate}")
 
-        normalized_dfs = []
         for file_key in matching_files:
             df = read_csv_from_s3(bucket_name, file_key)
             normalized_dfs.append(df)
