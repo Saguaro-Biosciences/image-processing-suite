@@ -124,25 +124,34 @@ def main(
     )
 
     # Set up the figure
-    plt.figure(figsize=(heatmap_data.shape[1], max(6, len(heatmap_data) * 0.3)))
+    plt.figure(figsize=(6, min(20, 0.2 * len(heatmap_data))))
     sns.heatmap(
         heatmap_data,
-        cmap=sns.color_palette(["lightgrey", "black"]),  # grey for 0, red for 1
+        cmap=sns.color_palette(["lightgrey", "black"]),
         linewidths=0.5,
         linecolor='black',
         cbar=False,
-        annot=True,
-        fmt='d'
+        annot=False,  # Disable numbers inside boxes to clean up space
+        xticklabels=True,
+        yticklabels=True
     )
 
     # Add a custom legend
-    plt.title("Compound Bioactivity by Timepoint")
+    plt.title("Compound Bioactivity by Timepoint", fontsize=12, pad=10)
     plt.xlabel("Timepoint")
     plt.ylabel("Compound")
+    plt.xticks(rotation=45, ha='right', fontsize=10)
+    plt.yticks(fontsize=6)
 
-    #plt.tight_layout()
+    # Custom legend (top-left corner, not in the middle!)
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor='black', label='Active', edgecolor='black')]
+    plt.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+
+    plt.tight_layout()
+
     bioheat_img = "compound_bioactivity_heatmap.png"
-    plt.savefig(bioheat_img)
+    plt.savefig(bioheat_img, dpi=300)
     plt.close()
 
     upload_image_to_s3(bucket_name, f"{output_prefix}/compound_bioactivity_heatmap.png", bioheat_img)
