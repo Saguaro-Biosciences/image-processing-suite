@@ -30,7 +30,6 @@ def upload_image_to_s3(bucket, key, image_path):
 def main(
     bucket_name,
     features_key,
-    plate_map_key,
     bioactive_threshold_quantile,
     induction_threshold,
     output_prefix,
@@ -43,7 +42,7 @@ def main(
     sig["induction"] = (sig[non_metadata_cols] > induction_threshold).sum(axis=1) / len(non_metadata_cols)
 
     sig_ind = sig[[
-        "Metadata_PlateID", "Metadata_Well", "Metadata_Timepoint",
+        "Metadata_Plate", "Metadata_Well", "Metadata_Timepoint",
         "Metadata_Compound", "Metadata_ConcLevel", "induction"
     ]]
 
