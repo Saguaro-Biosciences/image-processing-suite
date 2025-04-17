@@ -117,6 +117,7 @@ def main(
 
     
     logger.info("Performing heatmap.")
+    compound_bioactivity["Metadata_Compound"] = compound_bioactivity["Metadata_Compound"].apply(lambda x: x.upper())
     heatmap_data = compound_bioactivity.pivot(
         index="Metadata_Compound",
         columns="Metadata_Timepoint",
