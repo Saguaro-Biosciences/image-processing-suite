@@ -57,11 +57,19 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
                     file_key = f"{base_folder_path}/{plate}/{name}.csv"
                 df = read_csv_from_s3(bucket_name, file_key,s3)
 
-                if 'Metadata_Well' not in df.columns:
-                    logger.error(f"Missing 'Metadata_Well' in {file_key}")
-                    raise ValueError(f"Missing required metadata well columns before groupby in {name}.csv")
+                tables[name] = df  # Save immediately so Image is available
 
-                tables[name] = df
+        # Now propagate Metadata_Well using Image table
+            image_df = tables.get("Image")
+            for name, df in tables.items():
+                if 'Metadata_Well' not in df.columns:
+                    logger.info(f"'Metadata_Well' missing in {name}, merging from Image.csv using ImageNumber")
+                    df = df.merge(
+                        image_df[['ImageNumber', 'Metadata_Well']],
+                        on='ImageNumber',
+                        how='left'
+                    )
+                    tables[name] = df
 
             for name, prefix in table_info.items():
                 df = tables[name]
