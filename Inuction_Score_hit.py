@@ -96,7 +96,7 @@ def main(
     upload_image_to_s3(bucket_name, f"{output_prefix}/venn_all_vs_bioactive.png", venn_all_vs_bioactive)
 
     # Identify 48h column (int 48, or '48', or '15' fallback)
-    tp48_col = next((h for h in compound_bioactivity.Metadata_Timepoint.unique().tolist() if str(h) in ["48", "48h", "15"]), None)
+    tp48_col = next((h for h in compound_bioactivity.Metadata_Timepoint.unique().tolist() if str(h) in ["48", "48h", "15","Time_15"]), None)
     
     if tp48_col:
         tp48_induction = set(
