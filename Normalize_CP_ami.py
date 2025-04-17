@@ -29,7 +29,7 @@ def read_csv_from_s3(bucket_name, file_key,s3):
 def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output_bucket, DMSO,output_prefix, well_agg_func,no_time_subFolder):
     custom_config = Config(
     connect_timeout=30,  # Time to establish connection
-    read_timeout=300     # Time to wait for data (increase as needed)
+    read_timeout=600     # Time to wait for data (increase as needed)
     )
     s3 = boto3.client('s3', config=custom_config)
 
