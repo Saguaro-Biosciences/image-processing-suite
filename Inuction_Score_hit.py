@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from matplotlib_venn import venn2
 import matplotlib.patches as mpatches
 import seaborn as sns
+import re
 import boto3
 import csv
 from io import StringIO
@@ -13,6 +14,9 @@ from io import StringIO
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+def extract_timepoint_numeric(tp):
+        match = re.search(r'(\d+)', str(tp))
+        return int(match.group(1)) if match else float('inf')  # put unrecognized at the end
 
 def read_csv_from_s3(bucket_name, file_key):
     s3 = boto3.client("s3")
@@ -117,12 +121,38 @@ def main(
 
     
     logger.info("Performing heatmap.")
+
+    # Ensure compound names are uppercase
     compound_bioactivity["Metadata_Compound"] = compound_bioactivity["Metadata_Compound"].apply(lambda x: x.upper())
-    heatmap_data = compound_bioactivity.pivot(
-        index="Metadata_Compound",
-        columns="Metadata_Timepoint",
-        values="Bioactive"
+
+    # Normalize timepoint labels for consistent sorting
+    compound_bioactivity["Metadata_Timepoint_Numeric"] = compound_bioactivity["Metadata_Timepoint"].apply(extract_timepoint_numeric)
+
+    # Sort timepoints for consistent plotting
+    timepoint_order = (
+        compound_bioactivity[["Metadata_Timepoint", "Metadata_Timepoint_Numeric"]]
+        .drop_duplicates()
+        .sort_values("Metadata_Timepoint_Numeric")["Metadata_Timepoint"]
+        .tolist()
     )
+
+    # Pivot the table and aggregate duplicate compounds using max (logical OR)
+    heatmap_data = (
+        compound_bioactivity
+        .pivot_table(
+            index="Metadata_Compound",
+            columns="Metadata_Timepoint",
+            values="Bioactive",
+            aggfunc='max',
+            fill_value=0
+        )
+    )
+
+    # Reorder columns
+    heatmap_data = heatmap_data[timepoint_order]
+
+    # Add a Bioactive summary column: 1 if the compound was ever active
+    heatmap_data["Bioactive"] = (heatmap_data > 0).any(axis=1).astype(int)
 
     # Set up the figure
     plt.figure(figsize=(10, min(20, 0.2 * len(heatmap_data))))
@@ -132,7 +162,7 @@ def main(
         linewidths=0.5,
         linecolor='black',
         cbar=False,
-        annot=False,  # Disable numbers inside boxes to clean up space
+        annot=False,
         xticklabels=True,
         yticklabels=True
     )
@@ -144,19 +174,18 @@ def main(
     plt.xticks(rotation=45, ha='right', fontsize=10)
     plt.yticks(fontsize=6)
 
-    # Custom legend (top-left corner, not in the middle!)
     from matplotlib.patches import Patch
     legend_elements = [Patch(facecolor='black', label='Active', edgecolor='black')]
     plt.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
 
     plt.tight_layout()
 
+    # Save and upload
     bioheat_img = "compound_bioactivity_heatmap.png"
     plt.savefig(bioheat_img, dpi=300)
     plt.close()
 
     upload_image_to_s3(bucket_name, f"{output_prefix}/compound_bioactivity_heatmap.png", bioheat_img)
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Bioactivity Analysis with Venn Diagrams and Heatmaps.")
     parser.add_argument("--bucket_name", required=True, help="S3 bucket with feature and platemap files.")
