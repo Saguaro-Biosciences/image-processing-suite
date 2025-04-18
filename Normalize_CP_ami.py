@@ -37,7 +37,7 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
         logger.info(f"Processing plate ID: {plate}")
         filtered_plateMap = read_csv_from_s3(bucket_name, f"{base_folder_path}/{plate}_PlateMap.csv",s3)
         filtered_plateMap = filtered_plateMap[['Metadata_Compound', 'Metadata_ConcLevel', 'Metadata_Well', 'Metadata_Plate']]# plate map 
-        filtered_plateMap["Metadata_Compound"] = filtered_plateMap["Metadata_Compound"].apply(lambda x: x.upper())
+        filtered_plateMap["Metadata_Compound"] = filtered_plateMap["Metadata_Compound"].apply(lambda x: str(x).upper())
         for time in times:
             logger.info(f"Processing timepoint: {time}")
             table_info = {
