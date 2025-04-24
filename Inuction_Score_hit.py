@@ -52,22 +52,33 @@ def main(
         "Metadata_Compound", "Metadata_ConcLevel", "induction"
     ]]
 
-    logger.info("Computing bioactive threshold using ZPE control")
-    ind_zpe = sig_ind[sig_ind["Metadata_Compound"] == f"{DMSO}"]
-    bioactive_threshold = np.quantile(ind_zpe["induction"], bioactive_threshold_quantile)
-    logger.info(f"Bioactive threshold: {bioactive_threshold}")
+    logger.info("Computing per-timepoint DMSO thresholds")
+    ind_zpe_all = sig_ind[sig_ind["Metadata_Compound"] == f"{DMSO}"]
+    bioactive_thresholds = (
+        ind_zpe_all.groupby("Metadata_Timepoint")["induction"]
+        .quantile(bioactive_threshold_quantile)
+        .to_dict()
+    )
+    logger.info(f"Computed thresholds: {bioactive_thresholds}")
 
-    # Plot induction distribution
-    dist_img = "induction_distribution.png"
-    ind_zpe.induction.hist(bins=100)
+    # Plot per-timepoint induction distributions
+    plt.figure(figsize=(12, 8))
+    timepoints_sorted = sorted(bioactive_thresholds.keys(), key=extract_timepoint_numeric)
+    for i, tp in enumerate(timepoints_sorted):
+        tp_data = ind_zpe_all[ind_zpe_all["Metadata_Timepoint"] == tp]["induction"]
+        sns.histplot(tp_data, bins=100, kde=True, label=f"{tp} (thresh={bioactive_thresholds[tp]:.2f})", alpha=0.6)
+
+        plt.axvline(x=bioactive_thresholds[tp], color="black", linestyle="--", linewidth=1)
+
     plt.xlabel("Induction")
     plt.ylabel("Frequency")
-    plt.axvline(x=bioactive_threshold, color="red", linestyle="dashed", linewidth=2, label=f"Threshold {bioactive_threshold:.2f}")
-    plt.title(f"Distribution of ZPE Induction Score (Feature n = {len(non_metadata_cols)})")
+    plt.title("Per-Timepoint DMSO Induction Distributions")
     plt.legend()
-    plt.savefig(dist_img)
+    dist_img = "induction_distribution_per_timepoint.png"
+    plt.savefig(dist_img, dpi=300)
     plt.close()
-    upload_image_to_s3(bucket_name, f"{output_prefix}/induction_distribution.png", dist_img)
+    upload_image_to_s3(bucket_name, f"{output_prefix}/induction_distribution_per_timepoint.png", dist_img)
+
 
     # Bioactivity analysis
     ind_mean = (
@@ -77,7 +88,7 @@ def main(
     .reset_index()
     )
 
-    ind_mean["Bioactive"] = (ind_mean["induction_mean"] >= bioactive_threshold).astype(int)
+    ind_mean["Bioactive"] = ind_mean.apply(lambda row: int(row["induction_mean"] >= bioactive_thresholds.get(row["Metadata_Timepoint"], np.inf)), axis=1)
     compound_bioactivity = (
         ind_mean.groupby(["Metadata_Timepoint", "Metadata_Compound"])["Bioactive"]
         .max()
