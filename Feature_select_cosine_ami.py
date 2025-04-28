@@ -28,7 +28,7 @@ def double_sigmoid(x):
 
 def read_csv_from_s3(bucket_name, file_key):
     s3 = boto3.client('s3')
-    logger.info(f"Reading CSV from s3://{bucket_name}/{file_key}")
+    #logger.info(f"Reading CSV from s3://{bucket_name}/{file_key}")
     response = s3.get_object(Bucket=bucket_name, Key=file_key)
     csv_content = response['Body'].read().decode('utf-8')
 
@@ -79,7 +79,7 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, pe
             feature_select_file.unlink()
             logger.info(f"Selected features saved and removed for timepoint {timepoint}")
 
-        normalized_exp_selected = pd.concat(all_timepoints_selected, ignore_index=True)
+        normalized_exp_selected = pd.concat(all_timepoints_selected, ignore_index=True).fillna(0)
 
     else:
         logger.info("Performing global feature selection...")
