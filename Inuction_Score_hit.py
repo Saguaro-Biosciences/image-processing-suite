@@ -87,6 +87,12 @@ def main(
     .agg(induction_mean=("induction", "mean"))
     .reset_index()
     )
+    csv_buffer = StringIO()
+    output_key = f"{output_prefix}/Bioactivities_3holds_doses.csv"
+    ind_mean.to_csv(csv_buffer, index=False)
+    s3 = boto3.client("s3")
+    s3.put_object(Bucket=bucket_name, Key=output_key, Body=csv_buffer.getvalue())
+    logger.info(f"Saved Bioactivities s3://{bucket_name}/{output_key}")
 
     ind_mean["Bioactive"] = ind_mean.apply(lambda row: int(row["induction_mean"] >= bioactive_thresholds.get(row["Metadata_Timepoint"], np.inf)), axis=1)
     compound_bioactivity = (
@@ -94,12 +100,7 @@ def main(
         .max()
         .reset_index()
     )
-    csv_buffer = StringIO()
-    output_key = f"{output_prefix}/Bioactivities.csv"
-    heatmap_data.to_csv(csv_buffer, index=False)
-    s3 = boto3.client("s3")
-    s3.put_object(Bucket=bucket_name, Key=output_key, Body=csv_buffer.getvalue())
-    logger.info(f"Saved cosine similarity to s3://{bucket_name}/{output_key}")
+    
 
     logger.info("Generating Venn diagrams")
 
