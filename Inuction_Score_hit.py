@@ -94,6 +94,12 @@ def main(
         .max()
         .reset_index()
     )
+    csv_buffer = StringIO()
+    output_key = f"{output_prefix}/Bioactivities.csv"
+    heatmap_data.to_csv(csv_buffer, index=False)
+    s3 = boto3.client("s3")
+    s3.put_object(Bucket=bucket_name, Key=output_key, Body=csv_buffer.getvalue())
+    logger.info(f"Saved cosine similarity to s3://{bucket_name}/{output_key}")
 
     logger.info("Generating Venn diagrams")
 
@@ -164,12 +170,7 @@ def main(
 
     # Add a Bioactive summary column: 1 if the compound was ever active
     heatmap_data["Bioactive"] = (heatmap_data > 0).any(axis=1).astype(int)
-    csv_buffer = StringIO()
-    output_key = f"{output_prefix}/Bioactivity.csv"
-    heatmap_data.to_csv(csv_buffer, index=False)
-    s3 = boto3.client("s3")
-    s3.put_object(Bucket=bucket_name, Key=output_key, Body=csv_buffer.getvalue())
-    logger.info(f"Saved cosine similarity to s3://{bucket_name}/{output_key}")
+    
 
     # Set up the figure
     plt.figure(figsize=(10, min(20, 0.2 * len(heatmap_data))))
