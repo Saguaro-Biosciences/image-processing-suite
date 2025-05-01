@@ -78,8 +78,8 @@ def concatenate_normalized_csv_from_s3(bucket_name, plates, base_folder_path, pe
             all_timepoints_selected.append(df_selected)
             feature_select_file.unlink()
             logger.info(f"Selected features saved and removed for timepoint {timepoint}")
-            features = df_selected.columns[~df_selected.columns.str.contains("Metadata")].tolist()
-            df_selected=[features] = df_selected[features].apply(double_sigmoid).abs()
+            #features = df_selected.columns[~df_selected.columns.str.contains("Metadata")].tolist()
+            #df_selected=[features] = df_selected[features].apply(double_sigmoid).abs()
             csv_buffer = StringIO()
             df_selected.to_csv(csv_buffer, index=False)
             output_key = f"{output_prefix}/{exp}CP_features_selected_{timepoint}_dSig.csv"
