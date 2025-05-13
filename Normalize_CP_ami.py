@@ -26,7 +26,7 @@ def read_csv_from_s3(bucket_name, file_key,s3):
     dialect = csv.Sniffer().sniff(sample, delimiters=";,")
     return pd.read_csv(StringIO(csv_content), sep=dialect.delimiter)
 
-def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output_bucket, DMSO,output_prefix, well_agg_func,no_time_subFolder):
+def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output_bucket, DMSO,output_prefix, well_agg_func,no_time_subFolder,qc_drop):
     custom_config = Config(
     connect_timeout=30,  # Time to establish connection
     read_timeout=600     # Time to wait for data (increase as needed)
@@ -61,6 +61,7 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
 
         # Now propagate Metadata_Well using Image table
             image_df = tables.get("Image")
+            failing_images = image_df.loc[image_df.filter(like='ImageQC_').any(axis=1), 'ImageNumber']
             for name, df in tables.items():
                 if 'Metadata_Well' not in df.columns:
                     logger.info(f"'Metadata_Well' missing in {name}, merging from Image.csv using ImageNumber")
@@ -70,6 +71,10 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
                         how='left'
                     )
                     tables[name] = df
+                if qc_drop:
+                    logger.info(f"Removing QC failed images for {time}")
+                    tables[name] = df[~df['ImageNumber'].isin(failing_images)]
+
 
             for name, prefix in table_info.items():
                 df = tables[name]
@@ -121,6 +126,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_prefix", type=str,required=True, help="Prefix for the output files in S3.")
     parser.add_argument("--well_agg_func",type=str, default="mean", help="Function to aggregate at well level. Default mean.")
     parser.add_argument("--no_time_subFolder", action='store_true')
+    parser.add_argument("--qc_drop", action='store_true')
 
     args = parser.parse_args()
     logger.info(f"Starting normalization for base folder: {args.base_folder}")
@@ -131,6 +137,7 @@ if __name__ == "__main__":
         plates=args.plates,
         times=args.times,
         no_time_subFolder= args.no_time_subFolder,
+        qc_drop=args.qc_drop,
         DMSO=args.DMSO,
         output_bucket=args.output_bucket,
         output_prefix=args.output_prefix,
