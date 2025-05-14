@@ -61,10 +61,7 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
 
         # Now propagate Metadata_Well using Image table
             image_df = tables.get("Image")
-            cols_to_check = [col for col in image_df.columns 
-                 if col.startswith('ImageQC_ImageQuality_PowerLogLogSlope') 
-                 or col.startswith('ImageQC_ImageQuality_PercentMaximal')]
-            failing_images = image_df.loc[image_df[cols_to_check].any(axis=1), 'ImageNumber']
+            failing_images = image_df.loc[image_df.filter(like='ImageQC_').any(axis=1), 'ImageNumber']
             for name, df in tables.items():
                 if 'Metadata_Well' not in df.columns:
                     logger.info(f"'Metadata_Well' missing in {name}, merging from Image.csv using ImageNumber")
