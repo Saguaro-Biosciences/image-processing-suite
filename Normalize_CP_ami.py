@@ -82,8 +82,7 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
                 df = df.drop(columns=[
                     col for col in df.columns
                     if col == 'ImageNumber'
-                    or (col.startswith('Metadata') and col != 'Metadata_Well')
-                    or (col.startswith('Metadata') and col != 'Metadata_Site')
+                    or (col.startswith('Metadata') and col not in {'Metadata_Well', 'Metadata_Site'})
                     or any(sub in col for sub in drop_substrings)
                 ])
 
