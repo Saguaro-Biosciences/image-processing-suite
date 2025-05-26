@@ -87,6 +87,23 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
                 ])
 
                 df = df.rename(columns=lambda x: prefix + x if not x.startswith('Metadata_') else x)
+
+                # Get number of sites per well
+                site_counts = df.groupby("Metadata_Well").size()
+                max_sites = site_counts.max()
+                scaling_factors = (max_sites / site_counts).rename("scaling_factor")
+
+                # Merge scaling factor
+                df = df.merge(scaling_factors, on="Metadata_Well")
+                features_to_scale = [
+                    col for col in df.select_dtypes(include="integer").columns 
+                    if not col.startswith("Metadata")
+                ]
+                df[features_to_scale] = df[features_to_scale].multiply(df["scaling_factor"], axis=0)
+
+
+                # Optional: clean up temporary columns
+                df.drop(columns=["scaling_factor"], inplace=True)
                 df = df.groupby('Metadata_Well', as_index=False).agg(well_agg_func)
                 tables[name] = df
 
