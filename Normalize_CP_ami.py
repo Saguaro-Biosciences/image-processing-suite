@@ -66,7 +66,7 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
                 if 'Metadata_Well' not in df.columns:
                     logger.info(f"'Metadata_Well' missing in {name}, merging from Image.csv using ImageNumber")
                     df = df.merge(
-                        image_df[['ImageNumber', 'Metadata_Well']],
+                        image_df[['ImageNumber', 'Metadata_Well','Metadata_Site']],
                         on='ImageNumber',
                         how='left'
                     )
