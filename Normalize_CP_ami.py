@@ -83,6 +83,7 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
                     col for col in df.columns
                     if col == 'ImageNumber'
                     or (col.startswith('Metadata') and col != 'Metadata_Well')
+                    or (col.startswith('Metadata') and col != 'Metadata_Site')
                     or any(sub in col for sub in drop_substrings)
                 ])
 
@@ -108,7 +109,7 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
                 df[features_to_scale] = df[features_to_scale].multiply(df["scaling_factor"], axis=0)
 
                 # Clean up and aggregate
-                df.drop(columns=["scaling_factor"], inplace=True)
+                df.drop(columns=["scaling_factor","Metadata_Site"], inplace=True)
                 df = df.groupby("Metadata_Well", as_index=False).agg(well_agg_func)
                 tables[name] = df
 
