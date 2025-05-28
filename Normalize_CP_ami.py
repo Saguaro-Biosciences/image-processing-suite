@@ -79,15 +79,15 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
             for name, prefix in table_info.items():
                 df = tables[name]
 
-                df = df.drop(columns=[
-                    col for col in df.columns
-                    if col == 'ImageNumber'
-                    or (col.startswith('Metadata') and col not in {'Metadata_Well', 'Metadata_Site'})
-                    or any(sub in col for sub in drop_substrings)
-                ])
-
-                df = df.rename(columns=lambda x: prefix + x if not x.startswith('Metadata_') else x)
                 if qc_drop:
+                    df = df.drop(columns=[
+                        col for col in df.columns
+                        if col == 'ImageNumber'
+                        or (col.startswith('Metadata') and col not in {'Metadata_Well', 'Metadata_Site'})
+                        or any(sub in col for sub in drop_substrings)
+                    ])
+
+                    df = df.rename(columns=lambda x: prefix + x if not x.startswith('Metadata_') else x)
                     # Get number of sites per well
                     site_counts = df.groupby("Metadata_Well")["Metadata_Site"].nunique()
                     max_sites = site_counts.max()
@@ -109,7 +109,16 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
 
                     # Clean up and aggregate
                     df.drop(columns=["scaling_factor","Metadata_Site"], inplace=True)
-                df.drop(columns=['Metadata_Site'])
+
+                else not qc_drop:
+                    df = df.drop(columns=[
+                        col for col in df.columns
+                        if col == 'ImageNumber'
+                        or (col.startswith('Metadata') and col not in {'Metadata_Well'})
+                        or any(sub in col for sub in drop_substrings)
+                    ])
+
+                    df = df.rename(columns=lambda x: prefix + x if not x.startswith('Metadata_') else x)
                 df = df.groupby("Metadata_Well", as_index=False).agg(well_agg_func)
                 tables[name] = df
 
