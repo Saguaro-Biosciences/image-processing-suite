@@ -110,7 +110,7 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
                     # Clean up and aggregate
                     df.drop(columns=["scaling_factor","Metadata_Site"], inplace=True)
 
-                else not qc_drop:
+                else:
                     df = df.drop(columns=[
                         col for col in df.columns
                         if col == 'ImageNumber'
