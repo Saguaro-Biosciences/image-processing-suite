@@ -100,3 +100,18 @@ All of the codes relly in the general structure of the results where for a given
 ├── 📁 project_2/
 ...
 ```
+
+
+```
+📦 bucket/
+├── 📁 ─ Phenotypic_screen_HY-L022-custom_U2OS/
+│   ├── 📁 Subset1_10μM_run1/
+│   │   ├── 📁 6h/
+│   │   │   └── results.csv
+│   │   ├── 📁 12h/
+│   │   ├── 📁 24h/
+│   │   └── 📁 24h/
+│   ├── 📁 ubset1_10μM_run2/
+│   └── 📁 ubset1_10μM_run3/    
+...
+```
