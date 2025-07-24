@@ -31,9 +31,6 @@ def process_images_in_s3(bucket_name, image_folder, resolution):
 
     # 2. (FIX) Define the destination prefix before using it
     
-    if not dest_prefix.endswith('/'):
-        dest_prefix += '/'
-    dest_prefix = image_folder.replace('/Image/', '/Image_binned/')
 
     # 3. (IMPROVEMENT) Use the logger instead of print
     logger.info(f"🚀 Starting image processing for bucket: '{bucket_name}'")
@@ -54,7 +51,7 @@ def process_images_in_s3(bucket_name, image_folder, resolution):
             processed_data = process_image_in_memory(image_data, target_size=(resolution, resolution))
             
             # Using a more robust replacement that only acts on the prefix
-            new_key = obj.key.replace(image_folder, dest_prefix, 1)
+            new_key = obj.key.replace('Image', 'Image_binned')
             
             bucket.put_object(Key=new_key, Body=processed_data, ContentType='image/tiff')
             
