@@ -28,13 +28,8 @@ def process_images_in_s3(bucket_name, image_folder, resolution):
     """
     s3 = boto3.resource('s3')
     bucket = s3.Bucket(bucket_name)
-
-    # 2. (FIX) Define the destination prefix before using it
-    
-
-    # 3. (IMPROVEMENT) Use the logger instead of print
     logger.info(f"🚀 Starting image processing for bucket: '{bucket_name}'")
-    logger.info(f"📂 Source: '{image_folder}' -> Destination: '{dest_prefix}'")
+    logger.info(f"📂 Source: '{image_folder}' -> Destination: '{image_folder.replace('Image', 'Image_binned')}'")
 
     valid_extensions = ('.png', '.jpg', '.jpeg', '.tif', '.tiff')
     processed_count = 0
