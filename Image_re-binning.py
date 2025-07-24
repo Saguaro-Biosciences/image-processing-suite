@@ -30,9 +30,10 @@ def process_images_in_s3(bucket_name, image_folder, resolution):
     bucket = s3.Bucket(bucket_name)
 
     # 2. (FIX) Define the destination prefix before using it
-    dest_prefix = image_folder.replace('/Image/', '/Image_binned/')
+    
     if not dest_prefix.endswith('/'):
         dest_prefix += '/'
+    dest_prefix = image_folder.replace('/Image/', '/Image_binned/')
 
     # 3. (IMPROVEMENT) Use the logger instead of print
     logger.info(f"🚀 Starting image processing for bucket: '{bucket_name}'")
@@ -74,7 +75,7 @@ if __name__ == '__main__':
     parser.add_argument("--resolution", type=int, default=1080, required=False, help="Target resolution for the square image (e.g., 1080).")
 
     args = parser.parse_args()
-    
+            
     # 4. (FIX) Use the correct argument name: args.image_folder
     logger.info(f"Starting re-binning for image folder: {args.image_folder}")
 
