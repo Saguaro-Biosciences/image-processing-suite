@@ -33,6 +33,10 @@ def process_images_in_s3(bucket_name, image_folder, resolution):
 
     valid_extensions = ('.png', '.jpg', '.jpeg', '.tif', '.tiff')
     processed_count = 0
+    
+    # Necessary to avoid close matches with the already processed images.
+    if not image_folder.endswith('/'):
+        image_folder += '/'
 
     for obj in bucket.objects.filter(Prefix=image_folder):
         if obj.key.endswith('/') or not obj.key.lower().endswith(valid_extensions):
@@ -68,7 +72,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
             
-    # 4. (FIX) Use the correct argument name: args.image_folder
     logger.info(f"Starting re-binning for image folder: {args.image_folder}")
 
     process_images_in_s3(
