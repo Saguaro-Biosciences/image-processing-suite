@@ -14,11 +14,14 @@ from io import StringIO
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
 def extract_timepoint_numeric(tp):
-        match = re.search(r'(\d+)', str(tp))
-        return int(match.group(1)) if match else float('inf')  # put unrecognized at the end
+    """Extracts a numeric value from a timepoint string for sorting."""
+    match = re.search(r'(\d+)', str(tp))
+    return int(match.group(1)) if match else float('inf')  # put unrecognized at the end
 
 def read_csv_from_s3(bucket_name, file_key):
+    """Reads a CSV file from an S3 bucket into a pandas DataFrame."""
     s3 = boto3.client("s3")
     response = s3.get_object(Bucket=bucket_name, Key=file_key)
     csv_content = response["Body"].read().decode("utf-8")
@@ -27,6 +30,7 @@ def read_csv_from_s3(bucket_name, file_key):
     return pd.read_csv(StringIO(csv_content), sep=dialect.delimiter)
 
 def upload_image_to_s3(bucket, key, image_path):
+    """Uploads a local image file to an S3 bucket."""
     s3 = boto3.client("s3")
     with open(image_path, "rb") as f:
         s3.put_object(Bucket=bucket, Key=key, Body=f)
@@ -52,56 +56,69 @@ def main(
         "Metadata_Compound", "Metadata_ConcLevel", "induction"
     ]]
 
-    logger.info("Computing per-timepoint DMSO thresholds")
+    # UPDATED: Compute per-plate, per-timepoint DMSO thresholds
+    logger.info("Computing per-plate, per-timepoint DMSO thresholds")
     ind_zpe_all = sig_ind[sig_ind["Metadata_Compound"] == f"{DMSO}"]
     bioactive_thresholds = (
-        ind_zpe_all.groupby("Metadata_Timepoint")["induction"]
+        ind_zpe_all.groupby(["Metadata_Plate", "Metadata_Timepoint"])["induction"]
         .quantile(bioactive_threshold_quantile)
         .to_dict()
     )
-    logger.info(f"Computed thresholds: {bioactive_thresholds}")
+    logger.info(f"Computed thresholds (Plate, Timepoint): {bioactive_thresholds}")
 
-    # Plot per-timepoint induction distributions
+    # UPDATED: Plot per-timepoint induction distributions with per-plate thresholds
     plt.figure(figsize=(12, 8))
-    timepoints_sorted = sorted(bioactive_thresholds.keys(), key=extract_timepoint_numeric)
-    for i, tp in enumerate(timepoints_sorted):
+    # Get unique timepoints and sort them for plotting
+    unique_timepoints = ind_zpe_all["Metadata_Timepoint"].unique()
+    timepoints_sorted = sorted(unique_timepoints, key=extract_timepoint_numeric)
+
+    for tp in timepoints_sorted:
+        # Plot combined distribution for the timepoint
         tp_data = ind_zpe_all[ind_zpe_all["Metadata_Timepoint"] == tp]["induction"]
-        sns.histplot(tp_data, bins=100, kde=True, label=f"{tp} (thresh={bioactive_thresholds[tp]:.2f})", alpha=0.6)
+        sns.histplot(tp_data, bins=100, kde=True, label=f"Timepoint {tp}", alpha=0.6)
 
-        plt.axvline(x=bioactive_thresholds[tp], color="black", linestyle="--", linewidth=1)
+        # Add vertical lines for each plate's threshold at this timepoint
+        relevant_thresholds = {plate: thresh for (plate, timepoint), thresh in bioactive_thresholds.items() if timepoint == tp}
+        for plate, thresh in relevant_thresholds.items():
+            plt.axvline(x=thresh, color="grey", linestyle="--", linewidth=1)
 
-    plt.xlabel("Induction")
+    plt.xlabel("Induction Score")
     plt.ylabel("Frequency")
-    plt.title("Per-Timepoint DMSO Induction Distributions")
+    plt.title("Per-Timepoint DMSO Induction Distributions with Per-Plate Thresholds")
     plt.legend()
-    dist_img = "induction_distribution_per_timepoint.png"
-    plt.savefig(dist_img, dpi=300)
+    dist_img = "induction_distribution_per_plate_per_timepoint.png"
+    plt.savefig(dist_img, dpi=300, bbox_inches='tight')
     plt.close()
-    upload_image_to_s3(bucket_name, f"{output_prefix}/induction_distribution_per_timepoint.png", dist_img)
+    upload_image_to_s3(bucket_name, f"{output_prefix}/{dist_img}", dist_img)
 
 
-    # Bioactivity analysis
+    # UPDATED: Bioactivity analysis now grouped by Plate, Timepoint, Compound, and Concentration
     ind_mean = (
-    sig_ind[sig_ind["Metadata_Compound"] != f"{DMSO}"]
-    .groupby(["Metadata_Timepoint", "Metadata_Compound", "Metadata_ConcLevel"])
-    .agg(induction_mean=("induction", "mean"))
-    .reset_index()
+        sig_ind[sig_ind["Metadata_Compound"] != f"{DMSO}"]
+        .groupby(["Metadata_Plate", "Metadata_Timepoint", "Metadata_Compound", "Metadata_ConcLevel"])
+        .agg(induction_mean=("induction", "mean"))
+        .reset_index()
     )
     csv_buffer = StringIO()
-    output_key = f"{output_prefix}/Bioactivities_3holds_doses.csv"
+    output_key = f"{output_prefix}/Bioactivities_per_plate_doses.csv" # UPDATED: Filename
     ind_mean.to_csv(csv_buffer, index=False)
     s3 = boto3.client("s3")
     s3.put_object(Bucket=bucket_name, Key=output_key, Body=csv_buffer.getvalue())
     logger.info(f"Saved Bioactivities s3://{bucket_name}/{output_key}")
 
-    ind_mean["Bioactive"] = ind_mean.apply(lambda row: int(row["induction_mean"] >= bioactive_thresholds.get(row["Metadata_Timepoint"], np.inf)), axis=1)
+    # UPDATED: Apply the per-plate, per-timepoint threshold for bioactivity
+    ind_mean["Bioactive"] = ind_mean.apply(
+        lambda row: int(row["induction_mean"] >= bioactive_thresholds.get((row["Metadata_Plate"], row["Metadata_Timepoint"]), np.inf)),
+        axis=1
+    )
+
+    # The rest of the script correctly summarizes the new per-plate results
     compound_bioactivity = (
         ind_mean.groupby(["Metadata_Timepoint", "Metadata_Compound"])["Bioactive"]
-        .max()
+        .max()  # A compound is active at a timepoint if it's active on ANY plate
         .reset_index()
     )
     
-
     logger.info("Generating Venn diagrams")
 
     # All compound codes
@@ -117,7 +134,7 @@ def main(
     plt.close()
     upload_image_to_s3(bucket_name, f"{output_prefix}/venn_all_vs_bioactive.png", venn_all_vs_bioactive)
 
-    # Identify 48h column (int 48, or '48', or '15' fallback)
+    # Identify 48h column
     tp48_col = next((h for h in compound_bioactivity.Metadata_Timepoint.unique().tolist() if str(h) in ["48", "48h", "15","Time_14"]), None)
     
     if tp48_col:
@@ -130,7 +147,7 @@ def main(
         )
         
         plt.figure(figsize=(8, 6))
-        venn2([all_compounds, tp48_induction], set_labels=("All Bioactive", f"48h Bioactive {int(len(tp48_induction)/len(all_compounds)*100)}%"))
+        venn2([bioactive_compounds, tp48_induction], set_labels=("All Bioactive", f"48h Bioactive {int(len(tp48_induction)/len(bioactive_compounds)*100)}%"))
         plt.title("Bioactive Compounds at 48h vs All Timepoints")
         venn_48_vs_allbio = "venn_48_vs_allbio.png"
         plt.savefig(venn_48_vs_allbio)
@@ -172,7 +189,6 @@ def main(
     # Add a Bioactive summary column: 1 if the compound was ever active
     heatmap_data["Bioactive"] = (heatmap_data > 0).any(axis=1).astype(int)
     
-
     # Set up the figure
     plt.figure(figsize=(10, min(20, 0.2 * len(heatmap_data))))
     sns.heatmap(
@@ -205,8 +221,9 @@ def main(
     plt.close()
 
     upload_image_to_s3(bucket_name, f"{output_prefix}/compound_bioactivity_heatmap.png", bioheat_img)
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Bioactivity Analysis with Venn Diagrams and Heatmaps.")
+    parser = argparse.ArgumentParser(description="Bioactivity Analysis with per-plate normalization, Venn Diagrams, and Heatmaps.")
     parser.add_argument("--bucket_name", required=True, help="S3 bucket with feature and platemap files.")
     parser.add_argument("--features_key", required=True, help="S3 key to the normalized selected feature CSV.")
     parser.add_argument("--bioactive_threshold_quantile", type=float, default=0.95, help="Quantile threshold for ZPE/DMSO induction.")
