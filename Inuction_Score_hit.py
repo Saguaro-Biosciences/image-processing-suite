@@ -66,7 +66,7 @@ def main(
     )
     logger.info(f"Computed thresholds (Plate, Timepoint): {bioactive_thresholds}")
 
-    # --- NEW: Generate a separate induction distribution plot for each plate ---
+    # Generate a separate induction distribution plot for each plate
     logger.info("Generating induction distribution plots per plate.")
     unique_plates_dist = ind_zpe_all["Metadata_Plate"].unique()
 
@@ -80,7 +80,6 @@ def main(
             key=extract_timepoint_numeric
         )
         
-        # Plot the distribution for each timepoint on this plate
         for tp in plate_timepoints_sorted:
             tp_data = plate_dmso_data[plate_dmso_data["Metadata_Timepoint"] == tp]["induction"]
             threshold = bioactive_thresholds.get((plate_id, tp))
@@ -89,7 +88,6 @@ def main(
             if threshold is not None:
                 label_text += f" (thresh={threshold:.2f})"
             
-            # Plot distribution and get the color used
             ax = sns.histplot(tp_data, bins=100, kde=True, label=label_text, alpha=0.6)
             plot_color = ax.get_lines()[-1].get_c()
             
@@ -140,34 +138,46 @@ def main(
     bioactive_compounds = set(compound_bioactivity_summary.loc[compound_bioactivity_summary["Bioactive"] == 1, "Metadata_Compound"])
 
     plt.figure(figsize=(8, 5))
-    venn2([all_compounds, bioactive_compounds], set_labels=("All Compounds", f"Bioactive {int(len(bioactive_compounds)/len(all_compounds)*100)}%"))
+    venn2([all_compounds, bioactive_compounds], set_labels=("All Compounds", f"Bioactive ({len(bioactive_compounds)})"))
     plt.title("Bioactivity Overview (All Plates)")
     venn_all_vs_bioactive = "venn_all_vs_bioactive.png"
     plt.savefig(venn_all_vs_bioactive)
     plt.close()
     upload_image_to_s3(bucket_name, f"{output_prefix}/venn_all_vs_bioactive.png", venn_all_vs_bioactive)
 
-    tp48_col = next((h for h in compound_bioactivity_summary.Metadata_Timepoint.unique().tolist() if str(h) in ["48", "48h", "15","Time_14"]), None)
-    
-    if tp48_col and bioactive_compounds:
-        tp48_induction = set(
-            compound_bioactivity_summary.loc[
-                (compound_bioactivity_summary["Metadata_Timepoint"] == tp48_col) & 
-                (compound_bioactivity_summary["Bioactive"] == 1),
-                "Metadata_Compound"
-            ]
-        )
-        
-        plt.figure(figsize=(8, 6))
-        # Handle division by zero if no bioactive compounds exist
-        bioactive_count = len(bioactive_compounds)
-        percentage = int(len(tp48_induction)/bioactive_count*100) if bioactive_count > 0 else 0
-        venn2([bioactive_compounds, tp48_induction], set_labels=("All Bioactive", f"48h Bioactive {percentage}%"))
-        plt.title("Bioactive Compounds at 48h vs All Timepoints")
-        venn_48_vs_allbio = "venn_48_vs_allbio.png"
-        plt.savefig(venn_48_vs_allbio)
-        plt.close()
-        upload_image_to_s3(bucket_name, f"{output_prefix}/venn_48_vs_allbio.png", venn_48_vs_allbio)
+    # --- NEW: Generate Venn diagrams comparing each timepoint's actives to the total pool of actives ---
+    logger.info("Generating per-timepoint Venn diagrams.")
+    all_timepoints = compound_bioactivity_summary["Metadata_Timepoint"].unique()
+
+    if not bioactive_compounds:
+        logger.warning("No bioactive compounds found overall, skipping per-timepoint Venn diagrams.")
+    else:
+        for tp in all_timepoints:
+            logger.info(f"Generating Venn diagram for timepoint: {tp}")
+            
+            timepoint_actives = set(
+                compound_bioactivity_summary.loc[
+                    (compound_bioactivity_summary["Metadata_Timepoint"] == tp) & 
+                    (compound_bioactivity_summary["Bioactive"] == 1),
+                    "Metadata_Compound"
+                ]
+            )
+            
+            plt.figure(figsize=(8, 6))
+            bioactive_count = len(bioactive_compounds)
+            percentage = int(len(timepoint_actives) / bioactive_count * 100) if bioactive_count > 0 else 0
+            
+            venn2(
+                [bioactive_compounds, timepoint_actives],
+                set_labels=("All Bioactive Compounds", f"Bioactive at {tp} ({percentage}%)")
+            )
+            plt.title(f"Bioactive Compounds at Timepoint {tp} vs. All Bioactive")
+
+            sanitized_tp = str(tp).replace(" ", "_").replace("/", "_")
+            venn_filename = f"venn_bioactive_vs_all_tp_{sanitized_tp}.png"
+            plt.savefig(venn_filename, dpi=300)
+            plt.close()
+            upload_image_to_s3(bucket_name, f"{output_prefix}/{venn_filename}", venn_filename)
 
     # Heatmap generation is looped per plate
     logger.info("Performing heatmap generation per plate.")
