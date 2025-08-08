@@ -136,8 +136,11 @@ def run_batch_processing():
             DocumentName="AWS-RunShellScript",
             Parameters={'commands': master_command_list},
             OutputS3BucketName="cellprofiler-resuts",
-            OutputS3KeyPrefix=f"Batch_Run_Logs/Batch_{i+1}"
-        )
+            OutputS3KeyPrefix=f"Batch_Run_Logs/Batch_{i+1}",
+            CloudWatchOutputConfig={
+                "CloudWatchLogGroupName": "/aws/ssm/MySSMCommandLogs",
+                "CloudWatchOutputEnabled": True
+            })
         command_id = response['Command']['CommandId']
         print(f"Command {command_id} sent successfully to instance {instance_id}.")
 
