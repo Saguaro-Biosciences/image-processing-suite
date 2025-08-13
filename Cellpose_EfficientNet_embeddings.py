@@ -154,7 +154,7 @@ def main(args):
     # Create a list of tasks. Each task is a list of full S3 paths for one site.
     image_dir = os.path.dirname(args.load_data_key) # Assumes images are in the same S3 "folder"
     tasks = [
-        [f"s3://{args.bucket_input}/{image_dir}/{row[c]}" for c in channel_columns]
+        [f"/home/ubuntu/data/{row[c]}" for c in channel_columns]
         for _, row in load_data.iterrows()
     ]
     logging.info(f"Prepared {len(tasks)} sites for processing.")
