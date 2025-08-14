@@ -175,6 +175,14 @@ def main(args):
     except Exception as e:
         logging.error(f"Failed to read input CSV from S3. Error: {e}")
         return # Exit if we can't load the main file
+    s3_input_path = f"s3://{args.bucket_input}/{args.meta_data_key}"
+    logging.info(f"Reading load_data CSV from {s3_input_path}")
+    try:
+        meta_data = pd.read_csv(s3_input_path)
+    except Exception as e:
+        logging.error(f"Failed to read meta-data CSV from S3. Error: {e}")
+        return # Exit if we can't load the main file
+
 
     # --- Prepare Tasks for Parallel Processing ---
     # These columns should contain the relative paths to the TIFF images
@@ -219,7 +227,7 @@ def main(args):
 
     # --- Aggregate Data to Well Level ---
     logging.info("Aggregating data to well level...")
-    metadata_cols = [col for col in load_data.columns if col.startswith('Metadata_')]
+    metadata_cols = ["Metadata_Well","Metadata_Timepoint","Metadata_Plate"]
     df_subset = load_data[metadata_cols + ['mean_features']]
 
     agg_functions = {
@@ -230,7 +238,14 @@ def main(args):
             agg_functions[col] = 'first'
 
     well_level_data = df_subset.groupby('Metadata_Well').agg(agg_functions).reset_index()
-    logging.info(f"Aggregation complete. Final DataFrame shape: {well_level_data.shape}")
+
+    meta_data = pd.read_csv('data/Plate_P06_PlateMap.csv')
+    meta_data=pd.merge(
+        left=well_level_data,
+        right=meta_data,
+        on=['Metadata_Well','Metadata_Plate'],
+        how='inner' 
+    )
 
     # --- Save Final Results ---
     s3_output_path = f"s3://{args.bucket_output}/{args.out_data_path}"
@@ -249,6 +264,7 @@ if __name__ == '__main__':
     parser.add_argument('--bucket-input', type=str, required=True, help='Name of the S3 bucket for input data.')
     parser.add_argument('--bucket-output', type=str, required=True, help='Name of the S3 bucket for output results.')
     parser.add_argument('--load-data-key', type=str, required=True, help='S3 key (path within bucket) to the load_data.csv file.')
+    parser.add_argument('--meta-data-key', type=str, required=True, help='S3 key (path within bucket) to the load_data.csv file.')
     parser.add_argument('--out-data-path', type=str, required=True, help='S3 key (path within bucket) for the final output Parquet file.')
 
     args = parser.parse_args()
