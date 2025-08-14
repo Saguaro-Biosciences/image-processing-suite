@@ -24,6 +24,21 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+# Define function for nornalization and 8bit scaling
+def scale_to_8bit(image_16bit):
+    """
+    Intelligently scales a 16-bit image to 8-bit by stretching
+    the actual dynamic range of the image to the full 0-255 range.
+    """
+    min_val, max_val = image_16bit.min(), image_16bit.max()
+    if max_val == min_val:
+        return np.zeros(image_16bit.shape, dtype=np.uint8)
+    
+    # Stretch the relevant intensity range to 0-255
+    scaled_image = 255.0 * (image_16bit.astype(np.float32) - min_val) / (max_val - min_val)
+    
+    return scaled_image.astype(np.uint8)
+
 # --- 2. Define Worker Functions for Multiprocessing ---
 # These functions must be defined at the top level of the script for multiprocessing to work.
 
@@ -52,14 +67,14 @@ def init_worker(model_name, device_name, cellpose_model_path):
 
 def process_site(site_image_paths, box_size, feature_length):
     """
-    Processes a set of 4 channel images for a single site (a single row in the input CSV).
-    This is the core task that runs in parallel.
+    Processes a set of 4 channel images for a single site.
+    This version includes the correct 16-bit to 8-bit scaling workflow.
     """
     # Access the globally initialized models and objects for this worker
     global worker_cell_model, worker_model, worker_processor, worker_device, worker_s3fs
 
     try:
-        # Load all 4 channel images for the site directly from S3
+        # Load all 4 channel 16-bit images for the site directly from S3
         all_channels = []
         for s3_path in site_image_paths:
             with worker_s3fs.open(s3_path, 'rb') as f:
@@ -80,6 +95,7 @@ def process_site(site_image_paths, box_size, feature_length):
         half_box = box_size // 2
 
         for prop in props:
+            # ... (cropping logic is unchanged)
             y_center, x_center = map(int, prop.centroid)
             target_id = prop.label
             y1, y2 = max(0, y_center - half_box), min(h, y_center + half_box)
@@ -101,17 +117,30 @@ def process_site(site_image_paths, box_size, feature_length):
         for cell_crop in all_cell_crops:
             channel_features = []
             for ch in range(cell_crop.shape[2]):
-                single_channel = cell_crop[:, :, ch].astype(np.uint8)
-                if np.all(single_channel == 0):
+                
+                ### --- START: UPDATED WORKFLOW --- ###
+
+                # 1. Get the raw 16-bit data for this single channel
+                raw_16bit_channel = cell_crop[:, :, ch]
+                
+                if np.all(raw_16bit_channel == 0):
                     channel_features.append(np.zeros(feature_length, dtype=np.float32))
                     continue
+
+                # 2. Perform intensity scaling to convert to a scaled rich 8-bit image
+                scaled_8bit_channel = scale_to_8bit(raw_16bit_channel)
                 
-                pil_image = Image.fromarray(single_channel).convert("RGB")
-                inputs = worker_processor(images=pil_image,do_resize=False, return_tensors="pt").to(worker_device)
+                # 3. Convert to a 3-channel RGB PIL Image for the processor
+                pil_image = Image.fromarray(scaled_8bit_channel).convert("RGB")
+                inputs = worker_processor(images=pil_image, do_resize=False,return_tensors="pt").to(worker_device)
+                
+                ### --- END: UPDATED WORKFLOW --- ###
+
                 with torch.no_grad():
                     outputs = worker_model(**inputs)
                 features = outputs.pooler_output.cpu().numpy().squeeze()
                 channel_features.append(features)
+                
             all_stacked_features.append(np.stack(channel_features, axis=0))
 
         if not all_stacked_features:
@@ -122,7 +151,7 @@ def process_site(site_image_paths, box_size, feature_length):
 
     except Exception as e:
         logging.error(f"Error processing site {site_image_paths[0]}: {e}")
-        return np.zeros((4, feature_length)) # Return a zero vector on error
+        return np.zeros((4, feature_length))
 
 # --- 3. Main Execution Block ---
 def main(args):
