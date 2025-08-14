@@ -44,18 +44,14 @@ def scale_to_8bit(image_16bit):
 
 def init_worker(model_name, device_name, cellpose_model_path):
     """
-    Initializes models, processor, and S3 filesystem for each worker process.
-    This runs once per worker, avoiding re-loading heavy models for every task.
+    Initializes models and processor. The S3 filesystem is no longer needed here.
     """
-    global worker_cell_model, worker_model, worker_processor, worker_device, worker_s3fs
+    global worker_cell_model, worker_model, worker_processor, worker_device
 
     logging.info(f"Initializing worker on process ID: {os.getpid()}")
     
     # Setup device (GPU or CPU)
     worker_device = torch.device(device_name)
-    
-    # Setup S3 filesystem object for this worker
-    worker_s3fs = s3fs.S3FileSystem()
     
     # Load Cellpose model
     worker_cell_model = models.CellposeModel(gpu=(worker_device.type == 'cuda'), pretrained_model=cellpose_model_path)
@@ -74,13 +70,11 @@ def process_site(site_image_paths, box_size, feature_length):
     global worker_cell_model, worker_model, worker_processor, worker_device, worker_s3fs
 
     try:
-        # Load all 4 channel 16-bit images for the site directly from S3
-        all_channels = []
-        for s3_path in site_image_paths:
-            with worker_s3fs.open(s3_path, 'rb') as f:
-                all_channels.append(tifffile.imread(f))
+
+        all_channels = [tifffile.imread(local_path) for local_path in site_image_paths]
         
         image_4ch = np.stack(all_channels, axis=-1)
+
 
         # Run Cellpose to get masks
         masks, _, _ = worker_cell_model.eval([image_4ch], diameter=100, channels=None)
