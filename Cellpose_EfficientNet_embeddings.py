@@ -126,7 +126,7 @@ def process_site(site_image_paths, box_size, feature_length):
                 
                 # 3. Convert to a 3-channel RGB PIL Image for the processor
                 pil_image = Image.fromarray(scaled_8bit_channel).convert("RGB")
-                inputs = worker_processor(images=pil_image, do_resize=False,return_tensors="pt").to(worker_device)
+                inputs = worker_processor(images=pil_image,return_tensors="pt").to(worker_device)
                 
                 ### --- END: UPDATED WORKFLOW --- ###
 
