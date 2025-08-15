@@ -165,7 +165,7 @@ def main(args):
     s3_input_path = f"s3://{args.bucket_input}/{args.load_data_key}"
     logging.info(f"Reading load_data CSV from {s3_input_path}")
     try:
-        load_data = pd.read_csv(s3_input_path).iloc[,0:99]
+        load_data = pd.read_csv(s3_input_path).iloc[:,0:99]
     except Exception as e:
         logging.error(f"Failed to read input CSV from S3. Error: {e}")
         return # Exit if we can't load the main file
