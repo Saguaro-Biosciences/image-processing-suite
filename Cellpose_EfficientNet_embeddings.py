@@ -233,7 +233,6 @@ def main(args):
 
     well_level_data = df_subset.groupby('Metadata_Well').agg(agg_functions).reset_index()
 
-    meta_data = pd.read_csv('data/Plate_P06_PlateMap.csv')
     meta_data=pd.merge(
         left=well_level_data,
         right=meta_data,
