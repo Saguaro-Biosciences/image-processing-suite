@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
+from queue import Empty
 
 # Use torch.multiprocessing for efficient tensor sharing between processes
 import torch.multiprocessing as mp
@@ -85,7 +86,7 @@ def producer_worker(task_queue, data_queue, worker_id):
             image_4ch = np.stack(all_channels, axis=-1)
             
             # Run Cellpose to get masks
-            masks, _, _ = cell_model.eval(image_4ch, diameter=100, channels=) # Grayscale mode
+            masks, _, _ = cell_model.eval(image_4ch, diameter=100) # Grayscale mode
             props = regionprops(masks)
             
             if not props:
@@ -94,7 +95,7 @@ def producer_worker(task_queue, data_queue, worker_id):
                 continue
 
             # Process each cell found in the site and collect crops
-            all_cell_crops =
+            all_cell_crops = []
             h, w, _ = image_4ch.shape
 
             for prop in props:
@@ -109,8 +110,8 @@ def producer_worker(task_queue, data_queue, worker_id):
                 cell_crop_4ch = image_4ch[y1:y2, x1:x2, :]
                 masked_cell_crop = cell_crop_4ch * binary_mask
                 
-                pad_h = BOX_SIZE - masked_cell_crop.shape
-                pad_w = BOX_SIZE - masked_cell_crop.shape
+                pad_h = BOX_SIZE - masked_cell_crop.shape[0]
+                pad_w = BOX_SIZE - masked_cell_crop.shape[1]
                 padded_crop = np.pad(masked_cell_crop, ((0, pad_h), (0, pad_w), (0, 0)), 'constant')
                 all_cell_crops.append(padded_crop)
 
@@ -156,11 +157,9 @@ def consumer_worker(data_queue, results_dict, total_sites, stop_event):
                 pbar.update(1)
                 continue
 
-            # --- BATCHED INFERENCE LOGIC ---
-            all_channel_features = [ for _ in range(4)]
             
             # Prepare all single-channel crops for one large batch
-            batch_pil_images =
+            batch_pil_images = []
             for cell_crop in site_cell_crops:
                 for ch in range(4):
                     raw_16bit_channel = cell_crop[:, :, ch]
@@ -168,10 +167,10 @@ def consumer_worker(data_queue, results_dict, total_sites, stop_event):
                     pil_image = Image.fromarray(scaled_8bit_channel).convert("RGB")
                     batch_pil_images.append(pil_image)
 
-            site_features =
+            site_features =[]
             # Process in mini-batches to manage VRAM for sites with many cells
             for i in range(0, len(batch_pil_images), INFERENCE_BATCH_SIZE):
-                mini_batch = batch_pil_images
+                mini_batch = batch_pil_images[i : i + INFERENCE_BATCH_SIZE]
                 inputs = processor(images=mini_batch, return_tensors="pt").to(device)
 
                 # Use torch.no_grad() and autocast for maximum performance and memory efficiency
@@ -232,7 +231,7 @@ def main(args):
         return
 
     # --- Prepare Tasks for Producers ---
-    channel_columns =
+    channel_columns = ['FileName_CL488Y', 'FileName_CL640', 'FileName_DNA', 'FileName_CL488R']
     
     # Create a list of tasks. Each task is a tuple of (site_id, list_of_paths).
     # Using a unique site_id (like index) is crucial for collecting results.
@@ -298,7 +297,7 @@ def main(args):
 
         # Aggregate Data to Well Level
         logging.info("Aggregating data to well level...")
-        metadata_cols =
+        metadata_cols =["Metadata_Well","Metadata_Timepoint","Metadata_Plate"]
         df_subset = load_data[metadata_cols + ['mean_features']]
 
         agg_functions = {
@@ -307,12 +306,12 @@ def main(args):
         well_level_data = df_subset.groupby('Metadata_Well').agg(agg_functions).reset_index()
 
         # Merge with metadata
-        final_data = pd.merge(
-            left=well_level_data,
-            right=meta_data,
-            on=,
-            how='inner'
-        )
+        meta_data=pd.merge(
+        left=well_level_data,
+        right=meta_data,
+        on=['Metadata_Well','Metadata_Plate'],
+        how='inner' 
+             )
         final_data['mean_features'] = final_data['mean_features'].apply(lambda x: x.tolist())
 
         # Save Final Results
