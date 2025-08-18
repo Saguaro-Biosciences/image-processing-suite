@@ -79,6 +79,7 @@ def producer_worker(task_queue, data_queue, worker_id):
         if task is None:  # Sentinel value to signal termination
             logging.info(f"Producer-{worker_id} received sentinel. Shutting down.")
             break
+        
 
         site_id, site_image_paths = task
         try:
@@ -148,7 +149,23 @@ def consumer_worker(data_queue, results_dict, total_sites, stop_event):
     while not stop_event.is_set():
         try:
             # Get data from the queue with a timeout to allow checking the stop_event
-            site_id, site_cell_crops = data_queue.get(timeout=1)
+            # --- FIX STARTS HERE ---
+            item = data_queue.get(timeout=1)
+
+            if len(item) == 1: # This handles the case of no cells found
+                site_id = item[0]
+                site_cell_crops = [] # Manually set crops to an empty list
+            else:
+                site_id, site_cell_crops = item
+            # --- FIX ENDS HERE ---
+
+            if not site_cell_crops:
+                # If no cells were found, store a zero vector
+                # This block now correctly handles both cases
+                results_dict[site_id] = np.zeros((4, FEATURE_LENGTH), dtype=np.float32)
+                processed_sites += 1
+                pbar.update(1)
+                continue
             
             if not site_cell_crops:
                 # If no cells were found, store a zero vector
@@ -198,7 +215,7 @@ def consumer_worker(data_queue, results_dict, total_sites, stop_event):
             processed_sites += 1
             pbar.update(1)
 
-        except queue.Empty:
+        except Empty:
             # Queue was empty, loop again to check stop_event
             continue
         except Exception as e:
@@ -306,12 +323,12 @@ def main(args):
         well_level_data = df_subset.groupby('Metadata_Well').agg(agg_functions).reset_index()
 
         # Merge with metadata
-        meta_data=pd.merge(
-        left=well_level_data,
-        right=meta_data,
-        on=['Metadata_Well','Metadata_Plate'],
-        how='inner' 
-             )
+        final_data = pd.merge( # Assign to final_data
+            left=well_level_data,
+            right=meta_data,
+            on=['Metadata_Well','Metadata_Plate'],
+            how='inner'
+        )
         final_data['mean_features'] = final_data['mean_features'].apply(lambda x: x.tolist())
 
         # Save Final Results
