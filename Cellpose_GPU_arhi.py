@@ -193,7 +193,7 @@ def main(args):
     s3_input_path_meta = f"s3://{args.bucket_input}/{args.meta_data_key}"
     try:
         logging.info(f"Reading load_data CSV from {s3_input_path_load}")
-        load_data = pd.read_csv(s3_input_path_load).iloc[0:25,:]
+        load_data = pd.read_csv(s3_input_path_load)
         logging.info(f"Reading meta_data CSV from {s3_input_path_meta}")
         meta_data = pd.read_csv(s3_input_path_meta)
     except Exception as e:
