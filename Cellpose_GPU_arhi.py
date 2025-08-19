@@ -27,7 +27,7 @@ logging.basicConfig(
 )
 
 # --- MODEL AND PIPELINE CONFIGURATION ---
-MODEL_NAME = "timm/tf_efficientnetv2_m.in21k_ft_in1k"
+MODEL_NAME = "timm/tf_efficientnetv2_l.in21k"
 CELLPOSE_MODEL = 'nuclei'
 FEATURE_LENGTH = 1280
 BOX_SIZE = 200
@@ -190,12 +190,12 @@ def main(args):
 
     # --- Load Data ---
     s3_input_path_load = f"s3://{args.bucket_input}/{args.load_data_key}"
-    s3_input_path_meta = f"s3://{args.bucket_input}/{args.meta_data_key}"
+    #s3_input_path_meta = f"s3://{args.bucket_input}/{args.meta_data_key}"
     try:
         logging.info(f"Reading load_data CSV from {s3_input_path_load}")
         load_data = pd.read_csv(s3_input_path_load)
-        logging.info(f"Reading meta_data CSV from {s3_input_path_meta}")
-        meta_data = pd.read_csv(s3_input_path_meta)
+        #logging.info(f"Reading meta_data CSV from {s3_input_path_meta}")
+        #meta_data = pd.read_csv(s3_input_path_meta)
     except Exception as e:
         logging.error(f"Failed to read input CSVs from S3. Error: {e}")
         return
@@ -269,18 +269,14 @@ def main(args):
         for col in metadata_cols:
             if col != 'Metadata_Well':
                 agg_functions[col] = 'first'
+
         well_level_data = df_subset.groupby('Metadata_Well').agg(agg_functions).reset_index()
 
-        meta_data=pd.merge(
-        left=well_level_data,
-        right=meta_data,
-        on=['Metadata_Well','Metadata_Plate'],
-        how='inner' 
-    )
-        meta_data['mean_features'] = meta_data['mean_features'].apply(lambda x: x.tolist())
+        #final_data=pd.merge(left=well_level_data,right=meta_data,on=['Metadata_Well','Metadata_Plate'],how='inner')
+        well_level_data['mean_features'] = well_level_data['mean_features'].apply(lambda x: x.tolist())
 
         logging.info(f"Saving final results to {args.out_data_path}")
-        meta_data.to_parquet(args.out_data_path, engine='pyarrow')
+        well_level_data.to_parquet(args.out_data_path, engine='pyarrow')
         
         logging.info("Script finished successfully.")
 
@@ -291,7 +287,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-workers', type=int, default=os.cpu_count() * 2, help='Number of parallel CPU I/O processes.')
     parser.add_argument('--bucket-input', type=str, required=True, help='Name of the S3 bucket for input data.')
     parser.add_argument('--load-data-key', type=str, required=True, help='S3 key to the load_data.csv file.')
-    parser.add_argument('--meta-data-key', type=str, required=True, help='S3 key to the meta_data.csv file.')
+    parser.add_argument('--meta-data-key', type=str, required=False, help='S3 key to the meta_data.csv file.')
     parser.add_argument('--out-data-path', type=str, required=True, help='Local or S3 path for the final output Parquet file.')
 
     args = parser.parse_args()
