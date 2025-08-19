@@ -266,6 +266,9 @@ def main(args):
         agg_functions = {
             'mean_features': lambda arrays: np.mean(np.stack(arrays.values), axis=0)
         }
+        for col in metadata_cols:
+            if col != 'Metadata_Well':
+                agg_functions[col] = 'first'
         well_level_data = df_subset.groupby('Metadata_Well').agg(agg_functions).reset_index()
 
         meta_data=pd.merge(
