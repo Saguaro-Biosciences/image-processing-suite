@@ -193,7 +193,7 @@ def main(args):
     s3_input_path_meta = f"s3://{args.bucket_input}/{args.meta_data_key}"
     try:
         logging.info(f"Reading load_data CSV from {s3_input_path_load}")
-        load_data = pd.read_csv(s3_input_path_load)
+        load_data = pd.read_csv(s3_input_path_load).iloc[0:50,:]
         logging.info(f"Reading meta_data CSV from {s3_input_path_meta}")
         meta_data = pd.read_csv(s3_input_path_meta)
     except Exception as e:
@@ -268,16 +268,16 @@ def main(args):
         }
         well_level_data = df_subset.groupby('Metadata_Well').agg(agg_functions).reset_index()
 
-        final_data = pd.merge(
-            left=well_level_data,
-            right=meta_data,
-            on=['Metadata_Well', 'Metadata_Plate'],
-            how='inner'
-        )
-        final_data['mean_features'] = final_data['mean_features'].apply(lambda x: x.tolist())
+        meta_data=pd.merge(
+        left=well_level_data,
+        right=meta_data,
+        on=['Metadata_Well','Metadata_Plate'],
+        how='inner' 
+    )
+        meta_data['mean_features'] = meta_data['mean_features'].apply(lambda x: x.tolist())
 
         logging.info(f"Saving final results to {args.out_data_path}")
-        final_data.to_parquet(args.out_data_path, engine='pyarrow')
+        meta_data.to_parquet(args.out_data_path, engine='pyarrow')
         
         logging.info("Script finished successfully.")
 
