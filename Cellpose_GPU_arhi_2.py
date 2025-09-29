@@ -112,7 +112,7 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
         try: 
             item = data_queue.get(timeout=1) 
             site_id, image_4ch = item 
-            n_channels=image_4ch.shape[1]
+            n_channels=image_4ch.shape[-1]
 
             # Handle case where producer failed to load image 
             if image_4ch is None: 
