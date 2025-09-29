@@ -308,9 +308,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-consumers', type=int, default=2, help='Number of parallel GPU consumer processes.') 
     parser.add_argument('--max-workers', type=int, default=os.cpu_count() * 2, help='Number of parallel CPU I/O producer processes.') 
     parser.add_argument('--bucket-input', type=str, required=True, help='Name of the S3 bucket for input data.') 
-    parser.add_argument('--load-data-key', type=str, required=True, help='S3 key to the load_data.csv file.') 
-    parser.add_argument('--meta-data-key', type=str, required=False, help='S3 key to the meta_data.csv file.') 
-    parser.add_argument('--channels', type= '+', required=True, help='Channel list and order (first 3 are used for segmentation).')
+    parser.add_argument('--load-data-key', type=str, required=True, help='S3 key to the load_data.csv file.')
+    parser.add_argument('--channels', nargs='+', type=str, required=True, help='Channel list and order (first 3 are used for segmentation).')
     parser.add_argument('--out-data-path', type=str, required=True, help='Local or S3 path for the final output Parquet file.') 
 
     args = parser.parse_args() 
