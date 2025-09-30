@@ -206,7 +206,7 @@ def main(args):
     channel_columns = [f'FileName_{c}' for c in args.channels]
     image_df=pd.read_csv("/home/ubuntu/data/Image.csv")
     not_failing_images = (image_df.filter(like='ImageQC_').sum(axis=1) < 2)
-    load_data=load_data[not_failing_images]
+    load_data=load_data[not_failing_images].copy()
     tasks = [ 
         (index, [f"/home/ubuntu/data/{row[c]}" for c in channel_columns]) 
         for index, row in load_data.iterrows() 
@@ -262,11 +262,14 @@ def main(args):
             current_processed_count = len(results_dict) 
             pbar.update(current_processed_count - last_processed_count) 
             last_processed_count = current_processed_count 
-            time.sleep(5) 
+            time.sleep(2) 
         
         # Final update to ensure the progress bar reaches 100% 
         pbar.update(num_tasks - last_processed_count) 
         pbar.close() 
+
+        logging.info("All tasks processed. Signaling consumers to shut down.")
+        stop_event.set() 
 
         # **MODIFIED: Signal all consumers to stop and wait for them** stop_event.set() 
         for c in consumers: 
@@ -276,9 +279,11 @@ def main(args):
 
         # --- Process and Save Results --- 
         # Ensure results are sorted by site_id for correct merging 
-        site_results = [results_dict[i] for i in range(num_tasks)] 
+        original_indices = [task[0] for task in tasks]
+        site_results = [results_dict[i] for i in original_indices]
         
-        load_data['mean_features'] = site_results 
+        results_df = pd.DataFrame({'mean_features': site_results}, index=original_indices)
+        load_data = load_data.join(results_df)
         logging.info("Site-level features extracted and merged.") 
 
         # Aggregate Data to Well Level 
@@ -306,7 +311,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run the optimized cell image analysis pipeline.") 
 
     parser.add_argument('--num-consumers', type=int, default=2, help='Number of parallel GPU consumer processes.') 
-    parser.add_argument('--max-workers', type=int, default=os.cpu_count() * 2, help='Number of parallel CPU I/O producer processes.') 
+    parser.add_argument('--max-workers', type=int, default=os.cpu_count() * 4, help='Number of parallel CPU I/O producer processes.') 
     parser.add_argument('--bucket-input', type=str, required=True, help='Name of the S3 bucket for input data.') 
     parser.add_argument('--load-data-key', type=str, required=True, help='S3 key to the load_data.csv file.')
     parser.add_argument('--channels', nargs='+', type=str, required=True, help='Channel list and order (first 3 are used for segmentation).')
