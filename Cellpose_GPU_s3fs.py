@@ -56,7 +56,7 @@ def producer_worker(task_queue, data_queue, worker_id,channels):
     """ 
     logging.info(f"Producer-{worker_id} started.") 
     try:
-        channel_correction = [np.load(f'/home/ubuntu/data/{c}_illum.npy') for c in channels]
+        channel_correction = [np.load(f'{args.csv_image_key}/{c}_illum.npy') for c in channels]
         logging.info(f"Producer-{worker_id} loaded correction arrays.")
     except Exception as e:
         logging.error(f"Producer-{worker_id} FAILED to load correction arrays: {e}")
@@ -204,7 +204,7 @@ def main(args):
 
     # --- Prepare Tasks for Producers --- 
     channel_columns = [f'FileName_{c}' for c in args.channels]
-    image_df=pd.read_csv(args.csv_image_key)
+    image_df=pd.read_csv(f"{args.csv_image_key}/Image.csv")
     not_failing_images = (image_df.filter(like='ImageQC_').sum(axis=1) < 2)
     load_data=load_data[not_failing_images].copy()
     tasks = [ 
