@@ -47,7 +47,7 @@ def scale_to_8bit(image_16bit):
 
 # --- 2. Producer-Consumer Worker Functions --- 
 
-def producer_worker(task_queue, data_queue, worker_id,channels): 
+def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key): 
     """ 
     Producer Process: Handles CPU-bound I/O tasks ONLY. 
     - Fetches a site task from the task_queue. 
@@ -56,7 +56,7 @@ def producer_worker(task_queue, data_queue, worker_id,channels):
     """ 
     logging.info(f"Producer-{worker_id} started.") 
     try:
-        channel_correction = [np.load(f'{args.csv_image_key}/{c}_illum.npy') for c in channels]
+        channel_correction = [np.load(f'{csv_image_key}/{c}_illum.npy') for c in channels]
         logging.info(f"Producer-{worker_id} loaded correction arrays.")
     except Exception as e:
         logging.error(f"Producer-{worker_id} FAILED to load correction arrays: {e}")
@@ -233,7 +233,7 @@ def main(args):
 
         # --- Start Producer and Consumer Processes --- 
         producers = [ 
-            Process(target=producer_worker, args=(task_queue, data_queue, i,args.channels), name=f"Producer-{i}") 
+            Process(target=producer_worker, args=(task_queue, data_queue, i,args.channels,args.csv_image_key), name=f"Producer-{i}") 
             for i in range(args.max_workers) 
         ] 
         # **MODIFIED: Create a list of consumers** 
