@@ -204,7 +204,7 @@ def main(args):
 
     # --- Prepare Tasks for Producers --- 
     channel_columns = [f'FileName_{c}' for c in args.channels]
-    image_df=pd.read_csv(f"{args.csv_image_key}/Image.csv")
+    image_df=pd.read_csv(args.csv_image_key)
     not_failing_images = (image_df.filter(like='ImageQC_').sum(axis=1) < 2)
     load_data=load_data[not_failing_images].copy()
     tasks = [ 
