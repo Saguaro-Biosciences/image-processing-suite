@@ -315,7 +315,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run the optimized cell image analysis pipeline.")
     parser.add_argument('--data-base-path', type=str, required=True, help='Base path to the mounted data directory.') 
     parser.add_argument('--num-consumers', type=int, default=2, help='Number of parallel GPU consumer processes.') 
-    parser.add_argument('--max-workers', type=int, default=16, help='Number of parallel CPU I/O producer processes.') 
+    parser.add_argument('--max-workers', type=int, default=24, help='Number of parallel CPU I/O producer processes.') 
     parser.add_argument('--bucket-input', type=str, required=True, help='Name of the S3 bucket for input data.') 
     parser.add_argument('--load-data-key', type=str, required=True, help='S3 key to the load_data.csv file.')
     parser.add_argument('--csv-image-key', type=str, required=False, help='S3 key to the Image.csv file.')
