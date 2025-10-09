@@ -204,9 +204,13 @@ def main(args):
 
     # --- Prepare Tasks for Producers --- 
     channel_columns = [f'FileName_{c}' for c in args.channels]
-    image_df=pd.read_csv(f"{args.csv_image_key}/Image.csv")
-    not_failing_images = (image_df.filter(like='ImageQC_').sum(axis=1) < 2)
-    load_data=load_data[not_failing_images].copy()
+    if getattr(args, "csv_image_key", None):
+        image_df=pd.read_csv(f"{args.csv_image_key}/Image.csv")
+        not_failing_images = (image_df.filter(like='ImageQC_').sum(axis=1) < 2)
+        load_data=load_data[not_failing_images].copy()
+
+    else:
+        logging.info("No csv_image_key provided — skipping image QC filtering.")
     tasks = [ 
         (index, [f"{args.data_base_path}/{row[c]}" for c in channel_columns]) 
         for index, row in load_data.iterrows() 
@@ -311,10 +315,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run the optimized cell image analysis pipeline.")
     parser.add_argument('--data-base-path', type=str, required=True, help='Base path to the mounted data directory.') 
     parser.add_argument('--num-consumers', type=int, default=2, help='Number of parallel GPU consumer processes.') 
-    parser.add_argument('--max-workers', type=int, default=os.cpu_count() * 2, help='Number of parallel CPU I/O producer processes.') 
+    parser.add_argument('--max-workers', type=int, default=16, help='Number of parallel CPU I/O producer processes.') 
     parser.add_argument('--bucket-input', type=str, required=True, help='Name of the S3 bucket for input data.') 
     parser.add_argument('--load-data-key', type=str, required=True, help='S3 key to the load_data.csv file.')
-    parser.add_argument('--csv-image-key', type=str, required=True, help='S3 key to the Image.csv file.')
+    parser.add_argument('--csv-image-key', type=str, required=False, help='S3 key to the Image.csv file.')
     parser.add_argument('--channels', nargs='+', type=str, required=True, help='Channel list and order (first 3 are used for segmentation).')
     parser.add_argument('--out-data-path', type=str, required=True, help='Local or S3 path for the final output Parquet file.') 
 
