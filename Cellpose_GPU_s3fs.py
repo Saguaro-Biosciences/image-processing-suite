@@ -55,13 +55,14 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
     - Places the raw image array into the data_queue for the consumer. 
     """ 
     logging.info(f"Producer-{worker_id} started.") 
-    try:
-        channel_correction = [np.load(f'{csv_image_key}/{c}_illum.npy') for c in channels]
-        logging.info(f"Producer-{worker_id} loaded correction arrays.")
-    except Exception as e:
-        logging.error(f"Producer-{worker_id} FAILED to load correction arrays: {e}")
-        # If loading fails, this worker can't do anything.
-        return
+    if getattr(args, "csv_image_key", None):
+        try:
+            channel_correction = [np.load(f'{csv_image_key}/{c}_illum.npy') for c in channels]
+            logging.info(f"Producer-{worker_id} loaded correction arrays.")
+        except Exception as e:
+            logging.error(f"Producer-{worker_id} FAILED to load correction arrays: {e}")
+            # If loading fails, this worker can't do anything.
+            return
 
     while True: 
         task = task_queue.get() 
