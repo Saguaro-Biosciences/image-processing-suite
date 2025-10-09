@@ -55,7 +55,7 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
     - Places the raw image array into the data_queue for the consumer. 
     """ 
     logging.info(f"Producer-{worker_id} started.") 
-    if getattr(args, "csv_image_key", None):
+    if csv_image_key:
         try:
             channel_correction = [np.load(f'{csv_image_key}/{c}_illum.npy') for c in channels]
             logging.info(f"Producer-{worker_id} loaded correction arrays.")
@@ -71,17 +71,30 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
             break 
 
         site_id, site_image_paths = task 
-        try: 
-            all_channels = [tifffile.imread(path)/channel_correction[n] for n,path in enumerate(site_image_paths)] 
-            image_4ch = np.stack(all_channels, axis=-1) 
-            
-            # Put the raw image data onto the queue for the GPU worker 
-            data_queue.put((site_id, image_4ch)) 
+        if csv_image_key:
+            try: 
+                all_channels = [tifffile.imread(path)/channel_correction[n] for n,path in enumerate(site_image_paths)] 
+                image_4ch = np.stack(all_channels, axis=-1) 
+                
+                # Put the raw image data onto the queue for the GPU worker 
+                data_queue.put((site_id, image_4ch)) 
 
-        except Exception as e: 
-            logging.error(f"Producer-{worker_id} failed on site {site_id}: {e}") 
-            # Put a placeholder to signal completion even on failure 
-            data_queue.put((site_id, None)) 
+            except Exception as e: 
+                logging.error(f"Producer-{worker_id} failed on site {site_id}: {e}") 
+                # Put a placeholder to signal completion even on failure 
+                data_queue.put((site_id, None)) 
+        else:
+            try: 
+                all_channels = [tifffile.imread(path) for path in enumerate(site_image_paths)] 
+                image_4ch = np.stack(all_channels, axis=-1) 
+                
+                # Put the raw image data onto the queue for the GPU worker 
+                data_queue.put((site_id, image_4ch)) 
+
+            except Exception as e: 
+                logging.error(f"Producer-{worker_id} failed on site {site_id}: {e}") 
+                # Put a placeholder to signal completion even on failure 
+                data_queue.put((site_id, None))
 
 def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0): 
     """ 
