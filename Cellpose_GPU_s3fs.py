@@ -85,7 +85,7 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
                 data_queue.put((site_id, None)) 
         else:
             try: 
-                all_channels = [tifffile.imread(path) for path in enumerate(site_image_paths)] 
+                all_channels = [tifffile.imread(path) for path in site_image_paths] 
                 image_4ch = np.stack(all_channels, axis=-1) 
                 
                 # Put the raw image data onto the queue for the GPU worker 
