@@ -254,10 +254,19 @@ def main(args):
             Process(target=producer_worker, args=(task_queue, data_queue, i,args.channels,args.csv_image_key), name=f"Producer-{i}") 
             for i in range(args.max_workers) 
         ] 
-        # **MODIFIED: Create a list of consumers** 
+        # **MODIFIED: Create a list of consumers for GPUs >1** 
+        available_gpus = torch.cuda.device_count()
+        if available_gpus == 0:
+            logging.warning("No GPUs detected. Defaulting to GPU logic on CPU (index 0).")
+            available_gpus = 1
+
         consumers = [ 
-            Process(target=consumer_worker, args=(data_queue, results_dict, stop_event, i, 0), name=f"Consumer-{i}") 
-            for i in range(args.num_consumers) 
+            Process(
+                target=consumer_worker, 
+                args=(data_queue, results_dict, stop_event, i, i % available_gpus), 
+                name=f"Consumer-{i}"
+            ) 
+            for i in range(args.num_consumers)
         ] 
 
         logging.info(f"Starting {args.max_workers} producers and {args.num_consumers} consumers...") 
