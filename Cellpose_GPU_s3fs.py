@@ -330,7 +330,12 @@ def main(args):
 
         logging.info(f"Saving final results to {args.out_data_path}") 
         well_level_data.to_parquet(args.out_data_path, engine='pyarrow') 
+        # Explicitly close queues to release semaphores and silence warnings
+        task_queue.close()
+        task_queue.join_thread()
         
+        data_queue.close()
+        data_queue.join_thread()
         logging.info("Script finished successfully.") 
 
 
