@@ -14,11 +14,6 @@ from queue import Empty
 import torch.multiprocessing as mp 
 from torch.multiprocessing import Process, Queue, Event 
 
-# Import scientific libraries 
-from skimage.measure import regionprops 
-from cellpose import models 
-from transformers import AutoImageProcessor, AutoModel 
-
 # --- 1. Setup Logging and Constants --- 
 logging.basicConfig( 
     level=logging.INFO, 
@@ -97,6 +92,19 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
                 data_queue.put((site_id, None))
 
 def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0): 
+    import os
+    # This hides all GPUs except the one assigned to this worker
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    
+    # Because we masked the hardware, the script now thinks the assigned GPU 
+    # is at index 0. We MUST use 'cuda:0'.
+    internal_device_id = 0
+    
+    # --- 2. Lazy Imports (Prevent Context Leak) ---
+    # We import these HERE so they don't trigger GPU checks before the mask is applied
+    from skimage.measure import regionprops 
+    from cellpose import models 
+    from transformers import AutoImageProcessor, AutoModel
     """ 
     Consumer Process: Handles ALL GPU-bound tasks. 
     - Initializes BOTH Cellpose and the feature extractor on its assigned GPU. 
@@ -106,15 +114,15 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
     - Runs batched feature extraction on the GPU. 
     - Stores the final result. 
     """ 
-    logging.info(f"Consumer-{worker_id} started, assigned to GPU:{gpu_id}.") 
+    logging.info(f"Consumer-{worker_id} started. Physical GPU: {gpu_id} -> Mapped to cuda:{internal_device_id}") 
     
-    device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu") 
+    device = torch.device(f"cuda:{internal_device_id}" if torch.cuda.is_available() else "cpu") 
     if device.type == 'cpu': 
         logging.warning(f"Consumer-{worker_id}: CUDA not available. Running on CPU.") 
 
     # --- Load BOTH models onto the assigned GPU ONCE --- 
     logging.info(f"Consumer-{worker_id}: Loading Cellpose model onto {device}...") 
-    cell_model = models.CellposeModel(gpu=(device.type == 'cuda'), model_type=CELLPOSE_MODEL) 
+    cell_model = models.CellposeModel(gpu=(device.type == 'cuda'), model_type=CELLPOSE_MODEL, device=device) 
     
     logging.info(f"Consumer-{worker_id}: Loading feature extraction model onto {device}...") 
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME) 
