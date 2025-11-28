@@ -26,7 +26,7 @@ MODEL_NAME = "timm/tf_efficientnetv2_l.in21k"
 CELLPOSE_MODEL = 'nuclei' 
 FEATURE_LENGTH = 1280 
 BOX_SIZE = 200 
-INFERENCE_BATCH_SIZE = 256 
+INFERENCE_BATCH_SIZE = 1000 
 
 # --- Helper Functions --- 
 def scale_to_8bit(image_16bit): 
