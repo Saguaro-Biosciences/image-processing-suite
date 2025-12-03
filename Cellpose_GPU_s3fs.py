@@ -215,16 +215,17 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
                 n_cells = len(all_cell_crops)
                 reshaped_features = all_features_array.reshape(n_cells, n_channels, FEATURE_LENGTH) 
                 mean_site_features = np.mean(reshaped_features, axis=0) 
-                results_dict[site_id] = mean_site_features
+                results_dict[site_id] = (mean_site_features, n_cells)
+                logging.info(f"Consumer-{worker_id}: Finished SITE {site_id} ({n_cells} cells processed).")
             else:
-                 results_dict[site_id] = np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32)
+                 results_dict[site_id] = (np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32), 0)
 
         except Empty: 
             continue 
         except Exception as e: 
             logging.error(f"Consumer-{worker_id} failed: {e}") 
             if 'site_id' in locals() and 'n_channels' in locals(): 
-                results_dict[site_id] = np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32) 
+                results_dict[site_id] = (np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32), 0) 
 
     logging.info(f"Consumer-{worker_id} finished processing.")
 
@@ -335,16 +336,39 @@ def main(args):
 
         # --- Process and Save Results --- 
         # Ensure results are sorted by site_id for correct merging 
+        # --- Process and Save Results --- 
         original_indices = [task[0] for task in tasks]
-        site_results = [results_dict[i] for i in original_indices]
         
-        results_df = pd.DataFrame({'mean_features': site_results}, index=original_indices)
-        load_data = load_data.join(results_df)
-        logging.info("Site-level features extracted and merged.") 
+        # Retrieve the tuple (feature_array, cell_count)
+        raw_results = [results_dict[i] for i in original_indices]
+        
+        # Unpack into two separate lists
+        site_features = [item[0] for item in raw_results]
+        site_counts = [item[1] for item in raw_results]
+        
+        logging.info("Site-level processing complete. Preparing outputs.") 
 
-        # Aggregate Data to Well Level 
-        logging.info("Aggregating data to well level...") 
+        # --- OUTPUT 1: Cell Counts CSV ---
+        # Add the counts to the original load_data dataframe which has the Metadata
+        load_data['Cell_Count'] = site_counts
+        
+        # Define output path for counts (e.g., replace .parquet with _counts.csv)
+        counts_out_path = args.out_data_path.replace('.parquet', '_counts.csv')
+        
+        logging.info(f"Saving site-level cell counts to {counts_out_path}")
+        # Save complete metadata + counts
+        load_data.to_csv(counts_out_path, index=False)
+
+        # --- OUTPUT 2: Feature Aggregation (Parquet) ---
+        results_df = pd.DataFrame({'mean_features': site_features}, index=original_indices)
+        # We join again to ensure the 'mean_features' column is attached to the dataframe used for aggregation
+        # Note: 'load_data' now has 'Cell_Count', which is fine.
+        load_data = load_data.join(results_df)
+
+        logging.info("Aggregating features to well level...") 
         metadata_cols = ["Metadata_Well", "Metadata_Timepoint", "Metadata_Plate"] 
+        
+        # We only aggregate features here, but you could also aggregate Cell_Count (sum) if you wanted
         df_subset = load_data[metadata_cols + ['mean_features']] 
 
         agg_functions = { 
@@ -357,7 +381,7 @@ def main(args):
         well_level_data = df_subset.groupby('Metadata_Well').agg(agg_functions).reset_index() 
         well_level_data['mean_features'] = well_level_data['mean_features'].apply(lambda x: x.tolist()) 
 
-        logging.info(f"Saving final results to {args.out_data_path}") 
+        logging.info(f"Saving feature results to {args.out_data_path}") 
         well_level_data.to_parquet(args.out_data_path, engine='pyarrow') 
         # Explicitly close queues to release semaphores and silence warnings
         task_queue.close()
