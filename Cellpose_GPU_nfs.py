@@ -93,8 +93,6 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
 
 def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0): 
     import os
-    import gc # Ensure gc is imported inside the worker or globally
-    
     # This hides all GPUs except the one assigned to this worker
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     
@@ -103,14 +101,25 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
     internal_device_id = 0
     
     # --- 2. Lazy Imports (Prevent Context Leak) ---
+    # We import these HERE so they don't trigger GPU checks before the mask is applied
     from skimage.measure import regionprops 
     from cellpose import models 
     from transformers import AutoImageProcessor, AutoModel
-    
+    """ 
+    Consumer Process: Handles ALL GPU-bound tasks. 
+    - Initializes BOTH Cellpose and the feature extractor on its assigned GPU. 
+    - Pulls raw image data from the data_queue. 
+    - Runs Cellpose segmentation on the GPU. 
+    - Crops cells (fast CPU task). 
+    - Runs batched feature extraction on the GPU. 
+    - Stores the final result. 
+    """ 
     logging.info(f"Consumer-{worker_id} started. Physical GPU: {gpu_id} -> Mapped to cuda:{internal_device_id}") 
     
     device = torch.device(f"cuda:{internal_device_id}" if torch.cuda.is_available() else "cpu") 
-    
+    if device.type == 'cpu': 
+        logging.warning(f"Consumer-{worker_id}: CUDA not available. Running on CPU.") 
+
     # --- Load BOTH models onto the assigned GPU ONCE --- 
     logging.info(f"Consumer-{worker_id}: Loading Cellpose model onto {device}...") 
     cell_model = models.CellposeModel(gpu=(device.type == 'cuda'), model_type=CELLPOSE_MODEL, device=device) 
@@ -125,7 +134,7 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
         try: 
             item = data_queue.get(timeout=1) 
             site_id, image_4ch = item 
-            n_channels = image_4ch.shape[-1] if image_4ch is not None else 0
+            n_channels=image_4ch.shape[-1]
 
             # Handle case where producer failed to load image 
             if image_4ch is None: 
@@ -133,16 +142,7 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
                 continue 
             
             # --- 1. Run Cellpose Segmentation (GPU) --- 
-            # Added try/except for Cellpose OOM specifically
-            try:
-                masks, _, _ = cell_model.eval(image_4ch, diameter=100) 
-            except torch.cuda.OutOfMemoryError:
-                logging.warning(f"Consumer-{worker_id}: OOM during Cellpose on site {site_id}. Clearing cache and retrying.")
-                torch.cuda.empty_cache()
-                gc.collect()
-                # Retry once after clearing
-                masks, _, _ = cell_model.eval(image_4ch, diameter=100) 
-
+            masks, _, _ = cell_model.eval(image_4ch, diameter=100) 
             props = regionprops(masks) 
             
             if not props: 
@@ -170,7 +170,6 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
                 all_cell_crops.append(padded_crop) 
 
             # --- 3. Run Batched Feature Extraction (GPU) --- 
-            # Convert all crops to PIL once
             batch_pil_images = [] 
             for cell_crop in all_cell_crops: 
                 for ch in range(n_channels): 
@@ -179,73 +178,34 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
                     batch_pil_images.append(pil_image) 
 
             site_features = [] 
-            
-            # === DYNAMIC BATCH SIZE LOGIC START ===
-            current_batch_size = INFERENCE_BATCH_SIZE 
-            idx = 0
-            total_images = len(batch_pil_images)
+            for i in range(0, len(batch_pil_images), INFERENCE_BATCH_SIZE): 
+                mini_batch = batch_pil_images[i : i + INFERENCE_BATCH_SIZE] 
+                inputs = processor(images=mini_batch, return_tensors="pt").to(device) 
 
-            while idx < total_images:
-                # Determine end of current batch
-                end_idx = min(idx + current_batch_size, total_images)
-                mini_batch = batch_pil_images[idx : end_idx]
+                with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.float16): 
+                    outputs = feature_model(**inputs) 
                 
-                try:
-                    # Attempt Inference
-                    inputs = processor(images=mini_batch, return_tensors="pt").to(device) 
-                    with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.float16): 
-                        outputs = feature_model(**inputs) 
-                    
-                    # If successful, store results
-                    features = outputs.pooler_output.cpu().to(torch.float32).numpy() 
-                    site_features.append(features)
-                    
-                    # Advance index only on success
-                    idx = end_idx 
-
-                except torch.cuda.OutOfMemoryError:
-                    # === SOFT THRESHOLD TRIGGERED ===
-                    # 1. Clear memory
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    
-                    # 2. Halve the batch size
-                    old_bs = current_batch_size
-                    current_batch_size = max(1, current_batch_size // 2)
-                    
-                    logging.warning(f"Consumer-{worker_id}: OOM at site {site_id}. Dropping batch size: {old_bs} -> {current_batch_size}")
-                    
-                    # 3. If we are already at 1 and failing, we must abort this site to avoid infinite loop
-                    if old_bs == 1:
-                        logging.error(f"Consumer-{worker_id}: Site {site_id} failed even with batch_size=1.")
-                        # Return empty features for this site
-                        site_features = []
-                        break
-                    
-                    # Loop restarts at the same 'idx', but with smaller 'current_batch_size'
+                features = outputs.pooler_output.cpu().to(torch.float32).numpy() 
+                site_features.append(features) 
             
-            # === DYNAMIC BATCH SIZE LOGIC END ===
-
-            if len(site_features) > 0:
-                all_features_array = np.vstack(site_features) 
-                # Reshape: (N_cells, N_channels, Feature_Length)
-                # Note: We divide by n_channels because batch_pil_images flattened the channels
-                n_cells = len(all_cell_crops)
-                reshaped_features = all_features_array.reshape(n_cells, n_channels, FEATURE_LENGTH) 
-                mean_site_features = np.mean(reshaped_features, axis=0) 
-                results_dict[site_id] = mean_site_features
-            else:
-                 results_dict[site_id] = np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32)
+            all_features_array = np.vstack(site_features) 
+            reshaped_features = all_features_array.reshape(len(all_cell_crops), n_channels, FEATURE_LENGTH) 
+            
+            # Calculate and store the mean feature profile 
+            mean_site_features = np.mean(reshaped_features, axis=0) 
+            results_dict[site_id] = mean_site_features 
 
         except Empty: 
             continue 
         except Exception as e: 
+            # It's helpful to log which site failed if possible 
             site_id_str = f"site {site_id}" if 'site_id' in locals() else "an unknown site" 
             logging.error(f"Consumer-{worker_id} failed on {site_id_str}: {e}") 
-            if 'site_id' in locals() and 'n_channels' in locals(): 
+            # Ensure progress continues even on error 
+            if 'site_id' in locals(): 
                 results_dict[site_id] = np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32) 
 
-    logging.info(f"Consumer-{worker_id} finished processing.")
+    logging.info(f"Consumer-{worker_id} finished processing.") 
 
 
 # --- 3. Main Execution Block --- 
