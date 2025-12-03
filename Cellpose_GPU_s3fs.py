@@ -93,16 +93,11 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
 
 def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0): 
     import os
-    import gc # Ensure gc is imported inside the worker or globally
+    import gc 
     
-    # This hides all GPUs except the one assigned to this worker
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    
-    # Because we masked the hardware, the script now thinks the assigned GPU 
-    # is at index 0. We MUST use 'cuda:0'.
     internal_device_id = 0
     
-    # --- 2. Lazy Imports (Prevent Context Leak) ---
     from skimage.measure import regionprops 
     from cellpose import models 
     from transformers import AutoImageProcessor, AutoModel
@@ -111,36 +106,39 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
     
     device = torch.device(f"cuda:{internal_device_id}" if torch.cuda.is_available() else "cpu") 
     
-    # --- Load BOTH models onto the assigned GPU ONCE --- 
-    logging.info(f"Consumer-{worker_id}: Loading Cellpose model onto {device}...") 
+    # --- Load Models --- 
+    logging.info(f"Consumer-{worker_id}: Loading Cellpose model...") 
     cell_model = models.CellposeModel(gpu=(device.type == 'cuda'), model_type=CELLPOSE_MODEL, device=device) 
     
-    logging.info(f"Consumer-{worker_id}: Loading feature extraction model onto {device}...") 
+    logging.info(f"Consumer-{worker_id}: Loading feature extraction model...") 
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME) 
     feature_model = AutoModel.from_pretrained(MODEL_NAME).to(device).eval() 
     
     half_box = BOX_SIZE // 2 
     
+    # =========================================================================
+    # CHANGE 1: Initialize Batch Size OUTSIDE the loop
+    # The worker "learns" the safe limit and keeps it for future images.
+    # =========================================================================
+    current_batch_size = INFERENCE_BATCH_SIZE 
+
     while not stop_event.is_set(): 
         try: 
             item = data_queue.get(timeout=1) 
             site_id, image_4ch = item 
             n_channels = image_4ch.shape[-1] if image_4ch is not None else 0
 
-            # Handle case where producer failed to load image 
             if image_4ch is None: 
                 results_dict[site_id] = np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32) 
                 continue 
             
-            # --- 1. Run Cellpose Segmentation (GPU) --- 
-            # Added try/except for Cellpose OOM specifically
+            # --- 1. Run Cellpose Segmentation --- 
             try:
                 masks, _, _ = cell_model.eval(image_4ch, diameter=100) 
             except torch.cuda.OutOfMemoryError:
-                logging.warning(f"Consumer-{worker_id}: OOM during Cellpose on site {site_id}. Clearing cache and retrying.")
+                logging.warning(f"Consumer-{worker_id}: OOM during Cellpose (Site {site_id}). Clearing cache.")
                 torch.cuda.empty_cache()
                 gc.collect()
-                # Retry once after clearing
                 masks, _, _ = cell_model.eval(image_4ch, diameter=100) 
 
             props = regionprops(masks) 
@@ -169,8 +167,7 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
                 padded_crop = np.pad(masked_cell_crop, ((0, pad_h), (0, pad_w), (0, 0)), 'constant') 
                 all_cell_crops.append(padded_crop) 
 
-            # --- 3. Run Batched Feature Extraction (GPU) --- 
-            # Convert all crops to PIL once
+            # --- 3. Run Batched Feature Extraction --- 
             batch_pil_images = [] 
             for cell_crop in all_cell_crops: 
                 for ch in range(n_channels): 
@@ -179,57 +176,42 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
                     batch_pil_images.append(pil_image) 
 
             site_features = [] 
-            
-            # === DYNAMIC BATCH SIZE LOGIC START ===
-            current_batch_size = INFERENCE_BATCH_SIZE 
             idx = 0
             total_images = len(batch_pil_images)
 
             while idx < total_images:
-                # Determine end of current batch
                 end_idx = min(idx + current_batch_size, total_images)
                 mini_batch = batch_pil_images[idx : end_idx]
                 
                 try:
-                    # Attempt Inference
                     inputs = processor(images=mini_batch, return_tensors="pt").to(device) 
                     with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.float16): 
                         outputs = feature_model(**inputs) 
                     
-                    # If successful, store results
                     features = outputs.pooler_output.cpu().to(torch.float32).numpy() 
                     site_features.append(features)
-                    
-                    # Advance index only on success
                     idx = end_idx 
 
+                    # Optional: Slowly try to increase batch size again if it got too small?
+                    # For now, it's safer to stay low to prevent repeated crashing.
+
                 except torch.cuda.OutOfMemoryError:
-                    # === SOFT THRESHOLD TRIGGERED ===
-                    # 1. Clear memory
                     torch.cuda.empty_cache()
                     gc.collect()
                     
-                    # 2. Halve the batch size
                     old_bs = current_batch_size
+                    # Reduce persistent batch size
                     current_batch_size = max(1, current_batch_size // 2)
                     
-                    logging.warning(f"Consumer-{worker_id}: OOM at site {site_id}. Dropping batch size: {old_bs} -> {current_batch_size}")
+                    logging.warning(f"Consumer-{worker_id}: OOM at site {site_id}. PERMANENTLY dropping batch size: {old_bs} -> {current_batch_size}")
                     
-                    # 3. If we are already at 1 and failing, we must abort this site to avoid infinite loop
                     if old_bs == 1:
-                        logging.error(f"Consumer-{worker_id}: Site {site_id} failed even with batch_size=1.")
-                        # Return empty features for this site
+                        logging.error(f"Consumer-{worker_id}: Site {site_id} failed with batch_size=1.")
                         site_features = []
                         break
-                    
-                    # Loop restarts at the same 'idx', but with smaller 'current_batch_size'
             
-            # === DYNAMIC BATCH SIZE LOGIC END ===
-
             if len(site_features) > 0:
                 all_features_array = np.vstack(site_features) 
-                # Reshape: (N_cells, N_channels, Feature_Length)
-                # Note: We divide by n_channels because batch_pil_images flattened the channels
                 n_cells = len(all_cell_crops)
                 reshaped_features = all_features_array.reshape(n_cells, n_channels, FEATURE_LENGTH) 
                 mean_site_features = np.mean(reshaped_features, axis=0) 
@@ -240,8 +222,7 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
         except Empty: 
             continue 
         except Exception as e: 
-            site_id_str = f"site {site_id}" if 'site_id' in locals() else "an unknown site" 
-            logging.error(f"Consumer-{worker_id} failed on {site_id_str}: {e}") 
+            logging.error(f"Consumer-{worker_id} failed: {e}") 
             if 'site_id' in locals() and 'n_channels' in locals(): 
                 results_dict[site_id] = np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32) 
 
