@@ -157,7 +157,7 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id,expected_n_c
             props = regionprops(masks) 
             
             if not props: 
-                results_dict[site_id] = np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32) 
+                results_dict[site_id] = (np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32), 0)
                 continue 
 
             # --- 2. Crop Cells (CPU) --- 
@@ -381,9 +381,36 @@ def main(args):
         
         # We only aggregate features here, but you could also aggregate Cell_Count (sum) if you wanted
         df_subset = load_data[metadata_cols + ['mean_features']] 
+        # --- Debugging Helper Function ---
+        def safe_stack_and_mean(series):
+            # 1. Get all shapes in this group (Well)
+            shapes = [arr.shape for arr in series]
+            unique_shapes = set(shapes)
+            
+            # 2. If everything matches, proceed normally
+            if len(unique_shapes) == 1:
+                return np.mean(np.stack(series.values), axis=0)
+            
+            # 3. IF SHAPES DON'T MATCH: PRINT DEBUG INFO AND CRASH
+            else:
+                # Find the majority shape (the "correct" one)
+                from collections import Counter
+                most_common_shape = Counter(shapes).most_common(1)[0][0]
+                
+                logging.error(f"!!! SHAPE MISMATCH IN WELL !!! Found shapes: {unique_shapes}")
+                
+                # Identify the culprit sites
+                for site_id, arr in series.items():
+                    if arr.shape != most_common_shape:
+                        logging.error(f"Culprit Site: {site_id} | Shape: {arr.shape} (Expected {most_common_shape})")
+                
+                # Return a placeholder of the CORRECT shape to prevent crash, 
+                # allowing other wells to finish.
+                correct_shape_zeros = np.zeros(most_common_shape, dtype=np.float32)
+                return correct_shape_zeros
 
         agg_functions = { 
-            'mean_features': lambda arrays: np.mean(np.stack(arrays.values), axis=0) 
+            'mean_features': safe_stack_and_mean 
         } 
         for col in metadata_cols: 
             if col != 'Metadata_Well': 
