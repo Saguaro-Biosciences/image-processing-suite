@@ -304,7 +304,7 @@ def main(args):
         consumers = [ 
             Process(
                 target=consumer_worker, 
-                args=(data_queue, results_dict, stop_event, i, i % available_gpus,expected_n_channels), 
+                args=(data_queue, results_dict, stop_event, i, expected_n_channels,i % available_gpus), 
                 name=f"Consumer-{i}"
             ) 
             for i in range(args.num_consumers)
