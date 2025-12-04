@@ -91,7 +91,7 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
                 # Put a placeholder to signal completion even on failure 
                 data_queue.put((site_id, None))
 
-def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0): 
+def consumer_worker(data_queue, results_dict, stop_event, worker_id,expected_n_channels, gpu_id=0): 
     import os
     import gc 
     
@@ -126,11 +126,24 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
         try: 
             item = data_queue.get(timeout=1) 
             site_id, image_4ch = item 
-            n_channels = image_4ch.shape[-1] if image_4ch is not None else 0
-
+            
+            # --- CRITICAL FIX: Enforce Shape Consistency ---
+            
+            # Case A: Producer failed to load image entirely
             if image_4ch is None: 
-                results_dict[site_id] = np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32) 
+                logging.warning(f"Consumer-{worker_id}: [ERROR] Site {site_id} is None (Producer load failure). Returning empty placeholder.")
+                # Return placeholder with CORRECT shape (expected_n_channels, 1280)
+                results_dict[site_id] = (np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32), 0) 
                 continue 
+
+            # Case B: Image loaded, but channel count is wrong (e.g., corrupt file)
+            if image_4ch.shape[-1] != expected_n_channels:
+                logging.error(f"Consumer-{worker_id}: [ERROR] Site {site_id} has wrong shape. Got {image_4ch.shape}, expected last dim {expected_n_channels}. Skipping.")
+                results_dict[site_id] = (np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32), 0) 
+                continue
+            
+            # Valid execution
+            n_channels = expected_n_channels
             
             # --- 1. Run Cellpose Segmentation --- 
             try:
@@ -192,9 +205,6 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
                     site_features.append(features)
                     idx = end_idx 
 
-                    # Optional: Slowly try to increase batch size again if it got too small?
-                    # For now, it's safer to stay low to prevent repeated crashing.
-
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
                     gc.collect()
@@ -218,7 +228,7 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, gpu_id=0):
                 results_dict[site_id] = (mean_site_features, n_cells)
                 logging.info(f"Consumer-{worker_id}: Finished SITE {site_id} ({n_cells} cells processed).")
             else:
-                 results_dict[site_id] = (np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32), 0)
+                results_dict[site_id] = (np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32), 0)
 
         except Empty: 
             continue 
@@ -285,6 +295,7 @@ def main(args):
             for i in range(args.max_workers) 
         ] 
         # **MODIFIED: Create a list of consumers for GPUs >1** 
+        expected_n_channels = len(args.channels)
         available_gpus = torch.cuda.device_count()
         if available_gpus == 0:
             logging.warning("No GPUs detected. Defaulting to GPU logic on CPU (index 0).")
@@ -293,7 +304,7 @@ def main(args):
         consumers = [ 
             Process(
                 target=consumer_worker, 
-                args=(data_queue, results_dict, stop_event, i, i % available_gpus), 
+                args=(data_queue, results_dict, stop_event, i, i % available_gpus,expected_n_channels), 
                 name=f"Consumer-{i}"
             ) 
             for i in range(args.num_consumers)
