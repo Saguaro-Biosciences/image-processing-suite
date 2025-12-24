@@ -11,37 +11,36 @@ from tqdm import tqdm
 from queue import Empty
 
 # --- 1. QC Math Functions (CellProfiler Matched) ---
-
-def calculate_cp_metrics(image, channel_name, bit_depth=16):
+def calculate_cp_identical_slope(image, channel_name, bit_depth=16):
     """
-    Calculates QC metrics matching CellProfiler's ImageQuality module.
+    Calculates the 'PowerLogLogSlope' exactly as CellProfiler does.
     
-    ADJUSTMENTS FOR -1.4 RANGE:
-    1. No Hanning Window (matches CP's raw FFT).
-    2. Magnitude Spectrum (matches the slope scale).
+    CRITICAL FIX: 
+    CellProfiler calculates the slope of the MAGNITUDE (Amplitude) spectrum, 
+    not the Power spectrum, despite the name. 
+    Slope_Power approx 2 * Slope_Magnitude.
     """
     results = {}
     
-    # --- A. Percent Maximal (Saturation) ---
+    # 1. Percent Maximal (Saturation) - Remains the same
     max_val = (2**bit_depth) - 1
     pct_max = (np.sum(image >= max_val) / image.size) * 100
-    # Matching the naming convention for Corrected images
     results[f'ImageQuality_PercentMaximal_Corr{channel_name}'] = pct_max
 
-    # --- B. PowerLogLog Slope (Focus/Blur) ---
+    # 2. PowerLogLog Slope (Actually Amplitude Slope)
     try:
-        # 1. Convert to float and remove DC component (mean intensity)
-        # We do NOT apply a window here, to match CellProfiler's spectral leakage
+        # Convert to float (No windowing, No mean subtraction needed for slope)
         img_float = image.astype(np.float32)
-        img_float -= np.mean(img_float)
         
-        # 2. FFT & Magnitude Calculation
-        # Use Magnitude (Abs) instead of Power (Abs^2) to get the -1.0 to -1.5 range
+        # FFT
         F = fftpack.fft2(img_float)
         F_shifted = fftpack.fftshift(F)
-        magnitude_spectrum = np.abs(F_shifted)
         
-        # 3. Radial Averaging
+        # --- CRITICAL CHANGE: USE MAGNITUDE, NOT POWER ---
+        # CellProfiler uses |Amplitude|, not |Amplitude|^2
+        magnitude_spectrum = np.abs(F_shifted) 
+        
+        # Radial Averaging
         h, w = img_float.shape
         y, x = np.indices(magnitude_spectrum.shape)
         center = (h // 2, w // 2)
@@ -49,23 +48,22 @@ def calculate_cp_metrics(image, channel_name, bit_depth=16):
 
         tbin = np.bincount(r.ravel(), magnitude_spectrum.ravel())
         nr = np.bincount(r.ravel())
-        # Avoid division by zero
         radial_profile = tbin / (nr + 1e-10)
         
-        # 4. Select Frequency Range (Standard CP behavior)
-        # Avoid the very bottom (structure) and very top (camera noise)
+        # --- FREQUENCY RANGE ADJUSTMENT ---
+        # CellProfiler typically fits a broad range but avoids the DC (0) component.
+        # We start at index 5 to avoid the massive DC spike and very low freq artifacts.
         max_r = min(center)
-        start_idx = max(1, int(max_r * 0.1)) 
-        end_idx = int(max_r * 0.5)
+        start_idx = 5 
+        end_idx = int(max_r) # Use full range up to Nyquist
         
         if end_idx <= start_idx:
             end_idx = len(radial_profile) - 1
 
-        # 5. Log-Log Fit
-        indices = np.arange(start_idx, end_idx)
-        normalized_freqs = indices / max_r
+        # Log-Log Fit
+        freqs = np.arange(start_idx, end_idx)
         
-        log_x = np.log(normalized_freqs)
+        log_x = np.log(freqs)
         log_y = np.log(radial_profile[start_idx:end_idx] + 1e-10)
         
         if len(log_x) > 2:
@@ -112,7 +110,7 @@ def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path
                     img = img / corrections[i]
                 
                 # Run QC
-                metrics = calculate_cp_metrics(img, ch_name)
+                metrics = calculate_cp_identical_slope(img, ch_name)
                 site_results.update(metrics)
             
             results_dict[index] = site_results
