@@ -10,37 +10,27 @@ from scipy import fftpack
 from tqdm import tqdm
 from queue import Empty
 
-# --- 1. QC Math Functions (CellProfiler Matched) ---
+# --- 1. QC Math Functions (CP Matched: Magnitude + Full Range) ---
+
 def calculate_cp_identical_slope(image, channel_name, bit_depth=16):
-    """
-    Calculates the 'PowerLogLogSlope' exactly as CellProfiler does.
-    
-    CRITICAL FIX: 
-    CellProfiler calculates the slope of the MAGNITUDE (Amplitude) spectrum, 
-    not the Power spectrum, despite the name. 
-    Slope_Power approx 2 * Slope_Magnitude.
-    """
+    # Auto-detect bit depth max if needed
+    if image.dtype == np.uint8: max_val = 255
+    elif image.dtype == np.uint16: max_val = 65535
+    else: max_val = (2**bit_depth) - 1
+
     results = {}
     
-    # 1. Percent Maximal (Saturation) - Remains the same
-    max_val = (2**bit_depth) - 1
+    # 1. Percent Maximal
     pct_max = (np.sum(image >= max_val) / image.size) * 100
     results[f'ImageQuality_PercentMaximal_Corr{channel_name}'] = pct_max
 
-    # 2. PowerLogLog Slope (Actually Amplitude Slope)
+    # 2. PowerLogLog Slope
     try:
-        # Convert to float (No windowing, No mean subtraction needed for slope)
         img_float = image.astype(np.float32)
-        
-        # FFT
         F = fftpack.fft2(img_float)
         F_shifted = fftpack.fftshift(F)
+        magnitude_spectrum = np.abs(F_shifted)
         
-        # --- CRITICAL CHANGE: USE MAGNITUDE, NOT POWER ---
-        # CellProfiler uses |Amplitude|, not |Amplitude|^2
-        magnitude_spectrum = np.abs(F_shifted) 
-        
-        # Radial Averaging
         h, w = img_float.shape
         y, x = np.indices(magnitude_spectrum.shape)
         center = (h // 2, w // 2)
@@ -50,23 +40,15 @@ def calculate_cp_identical_slope(image, channel_name, bit_depth=16):
         nr = np.bincount(r.ravel())
         radial_profile = tbin / (nr + 1e-10)
         
-        # --- FREQUENCY RANGE ADJUSTMENT ---
-        # CellProfiler typically fits a broad range but avoids the DC (0) component.
-        # We start at index 5 to avoid the massive DC spike and very low freq artifacts.
+        # FULL RANGE (1 to Nyquist)
         max_r = min(center)
-        start_idx = 5 
-        end_idx = int(max_r) # Use full range up to Nyquist
+        start_idx = 1
+        end_idx = int(max_r)
         
-        if end_idx <= start_idx:
-            end_idx = len(radial_profile) - 1
-
-        # Log-Log Fit
-        freqs = np.arange(start_idx, end_idx)
-        
-        log_x = np.log(freqs)
-        log_y = np.log(radial_profile[start_idx:end_idx] + 1e-10)
-        
-        if len(log_x) > 2:
+        if end_idx > start_idx:
+            freqs = np.arange(start_idx, end_idx)
+            log_x = np.log(freqs)
+            log_y = np.log(radial_profile[start_idx:end_idx] + 1e-10)
             slope, _ = np.polyfit(log_x, log_y, 1)
             results[f'ImageQuality_PowerLogLogSlope_Corr{channel_name}'] = slope
         else:
@@ -80,11 +62,9 @@ def calculate_cp_identical_slope(image, channel_name, bit_depth=16):
 # --- 2. Parallel Worker ---
 
 def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path):
-    # Load illumination corrections once
     corrections = None
     if illum_path:
         try:
-            # Loads "DNA_illum.npy", etc.
             corrections = [np.load(os.path.join(illum_path, f"{c}_illum.npy")) for c in channels]
         except Exception as e:
             logging.error(f"Worker-{worker_id} could not load illum files: {e}")
@@ -105,11 +85,9 @@ def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path
 
                 img = tifffile.imread(path)
                 
-                # Apply Illumination Correction
                 if corrections is not None:
                     img = img / corrections[i]
                 
-                # Run QC
                 metrics = calculate_cp_identical_slope(img, ch_name)
                 site_results.update(metrics)
             
@@ -126,15 +104,8 @@ def main(args):
     
     logging.info(f"Reading input CSV: {args.load_data}")
     df = pd.read_csv(args.load_data)
-    
     channel_cols = [f'FileName_{c}' for c in args.channels]
     
-    # Validate columns exist
-    for col in channel_cols:
-        if col not in df.columns:
-            logging.error(f"Column {col} not found in CSV. Check --channels argument.")
-            return
-
     tasks = [
         (idx, [os.path.join(args.data_path, row[col]) for col in channel_cols])
         for idx, row in df.iterrows()
@@ -172,27 +143,22 @@ def main(args):
     logging.info("Merging results...")
     qc_df = pd.DataFrame.from_dict(results_dict, orient='index')
     qc_df = qc_df.sort_index()
-    
     final_df = pd.concat([df, qc_df], axis=1)
     
     final_df.to_csv(args.output, index=False)
-    logging.info(f"Complete! Processed {len(tasks)} sites in {time.time()-start_time:.2f}s.")
-    logging.info(f"Results saved to: {args.output}")
+    logging.info(f"Complete! Processed {len(tasks)} sites in {time.time()-start_time:.2f}s. Saved to {args.output}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Run High-Speed QC matching CellProfiler Metrics.")
-    parser.add_argument('--load-data', type=str, required=True, help='Path to Load_data.csv')
-    parser.add_argument('--data-path', type=str, required=True, help='Base directory for images')
-    parser.add_argument('--illum-path', type=str, default=None, help='Folder containing _illum.npy files')
-    parser.add_argument('--channels', nargs='+', required=True, help='List of channel names (e.g. DNA CL488R)')
-    parser.add_argument('--output', type=str, default='QC_Results.csv', help='Output CSV path')
-    parser.add_argument('--threads', type=int, default=24, help='Number of threads (default: 24)')
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--load-data', type=str, required=True)
+    parser.add_argument('--data-path', type=str, required=True)
+    parser.add_argument('--illum-path', type=str, default=None)
+    parser.add_argument('--channels', nargs='+', required=True)
+    parser.add_argument('--output', type=str, default='QC_Results.csv')
+    parser.add_argument('--threads', type=int, default=24)
     args = parser.parse_args()
 
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
+    try: mp.set_start_method('spawn', force=True)
+    except RuntimeError: pass
 
     main(args)
