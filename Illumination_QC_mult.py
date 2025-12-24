@@ -12,43 +12,69 @@ from queue import Empty
 
 # --- 1. QC Math Functions (CP Matched: Magnitude + Full Range) ---
 
+import numpy as np
+from scipy import fftpack
+
 def calculate_cp_identical_slope(image, channel_name, bit_depth=16):
-    # Auto-detect bit depth max if needed
+    """
+    Calculates QC metrics exactly matching CellProfiler's logic.
+    
+    FINAL ADJUSTMENT:
+    - Includes the FFT CORNERS in the radial average.
+    - The corners contain high-frequency noise that flattens the slope 
+      from -1.75 to ~ -1.4.
+    """
+    results = {}
+    
+    # 1. Percent Maximal (Saturation)
     if image.dtype == np.uint8: max_val = 255
     elif image.dtype == np.uint16: max_val = 65535
     else: max_val = (2**bit_depth) - 1
-
-    results = {}
-    
-    # 1. Percent Maximal
+        
     pct_max = (np.sum(image >= max_val) / image.size) * 100
     results[f'ImageQuality_PercentMaximal_Corr{channel_name}'] = pct_max
 
-    # 2. PowerLogLog Slope
+    # 2. PowerLogLog Slope (Magnitude + Full Range + Corners)
     try:
+        # Convert to float
         img_float = image.astype(np.float32)
+        
+        # FFT & Magnitude
         F = fftpack.fft2(img_float)
         F_shifted = fftpack.fftshift(F)
         magnitude_spectrum = np.abs(F_shifted)
         
+        # Radial Averaging
         h, w = img_float.shape
         y, x = np.indices(magnitude_spectrum.shape)
         center = (h // 2, w // 2)
+        
+        # Calculate distance to center for EVERY pixel, including corners
         r = np.sqrt((x - center[0])**2 + (y - center[1])**2).astype(int)
 
         tbin = np.bincount(r.ravel(), magnitude_spectrum.ravel())
         nr = np.bincount(r.ravel())
         radial_profile = tbin / (nr + 1e-10)
         
-        # FULL RANGE (1 to Nyquist)
-        max_r = min(center)
+        # --- THE FIX: GO TO THE CORNERS ---
+        # Previous: max_r = min(center)  (Stops at the edges)
+        # New:      max_r = max(r.ravel()) (Goes to the furthest corner)
+        
+        max_r = np.max(r) # This includes the noise-heavy corners
+        
+        # CellProfiler typically fits the whole valid range starting after DC
         start_idx = 1
         end_idx = int(max_r)
         
         if end_idx > start_idx:
             freqs = np.arange(start_idx, end_idx)
+            
+            # Check for valid data range to avoid indexing errors
+            valid_profile = radial_profile[start_idx:end_idx]
+            
             log_x = np.log(freqs)
-            log_y = np.log(radial_profile[start_idx:end_idx] + 1e-10)
+            log_y = np.log(valid_profile + 1e-10)
+            
             slope, _ = np.polyfit(log_x, log_y, 1)
             results[f'ImageQuality_PowerLogLogSlope_Corr{channel_name}'] = slope
         else:
