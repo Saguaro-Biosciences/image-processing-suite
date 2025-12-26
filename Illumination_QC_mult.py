@@ -12,91 +12,72 @@ import scipy.stats
 from tqdm import tqdm
 from queue import Empty
 
-# --- 1. QC Math Functions (CP Matched: PowerLogLogSlope + PercentMaximal) ---
+# --- 1. QC Math Functions (Renamed to FORCE worker update) ---
 
-def calculate_cp_identical_slope(image, channel_name):
+def calculate_cp_metrics_v2(image, channel_name):
     """
-    Calculates QC metrics replicating CellProfiler's MeasureImageQuality logic.
+    V2 Update: Matches CellProfiler logic by using RADIAL SUM (not Mean).
     
-    1. Percent Maximal: Checks for saturation (specifically for 16-bit images).
-    2. PowerLogLogSlope: FFT -> Power Spectrum -> Radial Sum -> Log-Log Slope.
+    Logic:
+    1. FFT -> Shift -> Power Spectrum (|F|^2).
+    2. Radial Sum: Sum of power in each ring.
+       (Slope of Sum = Slope of Mean + 1.0).
+       This shifts the slope from ~ -2.5 to ~ -1.5.
     """
     results = {}
     
-    # --- 1. Percent Maximal (Saturation for 16-bit) ---
-    # CellProfiler MeasureImageQuality "PercentMaximal" is the percentage of pixels 
-    # at the maximum possible value of the bit-depth.
-    
-    # Determine max value based on dtype, defaulting to 16-bit (65535) if unsure
+    # --- Percent Maximal (Saturation) ---
     if image.dtype == np.uint8:
         max_val = 255
-    elif image.dtype == np.uint16:
-        max_val = 65535
     else:
-        # Fallback for floating point or other types: assume standard 16-bit range or 1.0
-        max_val = 65535 if image.max() > 1.0 else 1.0
+        max_val = 65535 # Default to 16-bit
         
     num_saturated = np.sum(image >= max_val)
     pct_max = (num_saturated / image.size) * 100
     results[f'ImageQuality_PercentMaximal_{channel_name}'] = pct_max
 
-    # --- 2. PowerLogLogSlope (CellProfiler Logic) ---
+    # --- PowerLogLogSlope (Radial Sum) ---
     try:
-        # A. FFT and Shift
-        # CellProfiler casts to float before FFT
+        # 1. FFT
         image_float = image.astype(float)
         F = scipy.fft.fft2(image_float)
         F_shifted = scipy.fft.fftshift(F)
         
-        # B. Power Spectrum (Magnitude Squared)
-        # CP uses |F|^2. 
+        # 2. Power Spectrum (Squared Magnitude)
         power_spectrum = np.abs(F_shifted) ** 2
         
-        # C. Radial Summation Setup
+        # 3. Radial Map
         h, w = image.shape
         center_y, center_x = h // 2, w // 2
         y, x = np.indices((h, w))
-        
-        # Calculate distances
         r = np.sqrt((x - center_x)**2 + (y - center_y)**2)
         r_int = r.astype(int)
         
-        # D. Define Max Radius (Exclude Corners)
-        # CellProfiler stops at the edge of the inscribed circle.
-        # Including corners would cause the Sum to drop artificially, steeping the slope.
+        # 4. Define Max Radius (Nyquist / Inscribed Circle)
+        # We must stop before the corners, or the sum drops artifically.
         max_r = int(min(h, w) / 2)
         
-        # E. Calculate Radial Sum
-        # We use bincount for speed, but DO NOT divide by the count (nr).
-        # We only care about bins 1 to max_r (ignoring DC at 0)
-        
-        # Flatten arrays for bincount
+        # 5. Radial Summation
+        # Use simple bincount with weights (This calculates SUM, not Mean)
         r_flat = r_int.ravel()
         p_flat = power_spectrum.ravel()
         
-        # Calculate Sum of Power in each ring
-        # weights=p_flat ensures we sum the power values
         radial_sum = np.bincount(r_flat, weights=p_flat)
         
-        # Slice to valid range [1, max_r]
-        # We start at 1 to ignore DC component
+        # Slice to valid range [1, max_r] (Ignore DC at 0)
         if len(radial_sum) > max_r:
             radial_sum = radial_sum[1:max_r+1]
             freqs = np.arange(1, max_r + 1)
         else:
-            # Fallback if image is tiny
             radial_sum = radial_sum[1:]
             freqs = np.arange(1, len(radial_sum) + 1)
         
-        # F. Filter valid values for Log-Log
+        # 6. Log-Log Slope
         valid_mask = radial_sum > 0
-        
         if np.sum(valid_mask) > 2:
             freq_log = np.log(freqs[valid_mask])
             power_log = np.log(radial_sum[valid_mask])
             
-            # G. Linear Regression
-            # Returns: slope, intercept, r_value, p_value, std_err
             slope, _, _, _, _ = scipy.stats.linregress(freq_log, power_log)
             results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = slope
         else:
@@ -107,18 +88,31 @@ def calculate_cp_identical_slope(image, channel_name):
 
     return results
 
-# --- 2. Parallel Worker ---
+# --- 2. Parallel Worker (Renamed) ---
 
-def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path):
+def qc_worker_v2(task_queue, results_dict, worker_id, channels, illum_path):
+    """
+    Worker V2: Uses calculate_cp_metrics_v2
+    """
     corrections = None
     if illum_path:
         try:
-            corrections = [np.load(os.path.join(illum_path, f"{c}_illum.npy")) for c in channels]
-        except Exception as e:
-            logging.error(f"Worker-{worker_id} could not load illum files: {e}")
+            corrections = []
+            for c in channels:
+                c_path = os.path.join(illum_path, f"{c}_illum.npy")
+                if os.path.exists(c_path):
+                    corrections.append(np.load(c_path))
+                else:
+                    corrections.append(None)
+        except Exception:
+            pass
 
     while True:
-        task = task_queue.get()
+        try:
+            task = task_queue.get(timeout=2)
+        except Empty:
+            break
+            
         if task is None:
             break
 
@@ -133,43 +127,36 @@ def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path
 
                 img = tifffile.imread(path)
                 
-                # Apply Illumination Correction if loaded
-                if corrections is not None:
-                    # Ensure dimensions match before division
+                if corrections and corrections[i] is not None:
                     if img.shape == corrections[i].shape:
                         img = img / corrections[i]
                 
-                metrics = calculate_cp_identical_slope(img, ch_name)
+                # CALL THE NEW V2 FUNCTION
+                metrics = calculate_cp_metrics_v2(img, ch_name)
                 site_results.update(metrics)
             
             results_dict[index] = site_results
 
         except Exception as e:
-            logging.error(f"Worker-{worker_id} failed on index {index}: {e}")
             results_dict[index] = {f"QC_Error": str(e)}
 
 # --- 3. Orchestrator ---
 
 def main(args):
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
     
-    logging.info(f"Reading input CSV: {args.load_data}")
+    logging.info(f"Reading CSV: {args.load_data}")
     df = pd.read_csv(args.load_data)
     
-    # Construct expected column names for file paths
     channel_cols = [f'FileName_{c}' for c in args.channels]
     
-    # verify columns exist
-    for col in channel_cols:
-        if col not in df.columns:
-            logging.error(f"Column {col} not found in CSV. Check your --channels argument.")
-            return
-
+    # 1. Setup Tasks
     tasks = [
         (idx, [os.path.join(args.data_path, row[col]) for col in channel_cols])
         for idx, row in df.iterrows()
     ]
 
+    # 2. Setup Multiprocessing
     manager = mp.Manager()
     results_dict = manager.dict()
     task_queue = mp.Queue()
@@ -179,45 +166,53 @@ def main(args):
     for _ in range(args.threads):
         task_queue.put(None)
 
-    logging.info(f"Starting QC on {len(tasks)} sites using {args.threads} threads...")
+    logging.info(f"Starting QC V2 (Force Update) on {len(tasks)} sites...")
     
     start_time = time.time()
     processes = []
     
+    # 3. Launch NEW Workers
     for i in range(args.threads):
-        p = mp.Process(target=qc_producer_worker, 
+        p = mp.Process(target=qc_worker_v2, 
                        args=(task_queue, results_dict, i, args.channels, args.illum_path))
         p.start()
         processes.append(p)
 
+    # 4. Monitor
     with tqdm(total=len(tasks)) as pbar:
-        while len(results_dict) < len(tasks):
-            pbar.n = len(results_dict)
+        while True:
+            completed = len(results_dict)
+            pbar.n = completed
             pbar.refresh()
+            if completed >= len(tasks):
+                break
+            if not any(p.is_alive() for p in processes) and completed < len(tasks):
+                logging.error("Workers died unexpectedly.")
+                break
             time.sleep(1)
 
     for p in processes:
         p.join()
 
+    # 5. Save
     logging.info("Merging results...")
     qc_df = pd.DataFrame.from_dict(results_dict, orient='index')
     qc_df = qc_df.sort_index()
     final_df = pd.concat([df, qc_df], axis=1)
     
     final_df.to_csv(args.output, index=False)
-    logging.info(f"Complete! Processed {len(tasks)} sites in {time.time()-start_time:.2f}s. Saved to {args.output}")
+    logging.info(f"Complete. Saved to {args.output}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--load-data', type=str, required=True, help='Path to CSV containing image filenames')
-    parser.add_argument('--data-path', type=str, required=True, help='Base path where images are stored')
-    parser.add_argument('--illum-path', type=str, default=None, help='Path to folder containing numpy illumination functions')
-    parser.add_argument('--channels', nargs='+', required=True, help='List of channel names (e.g. DAPI GFP)')
-    parser.add_argument('--output', type=str, default='QC_Results.csv')
+    parser.add_argument('--load-data', type=str, required=True)
+    parser.add_argument('--data-path', type=str, required=True)
+    parser.add_argument('--illum-path', type=str, default=None)
+    parser.add_argument('--channels', nargs='+', required=True)
+    parser.add_argument('--output', type=str, default='QC_Results_V2.csv')
     parser.add_argument('--threads', type=int, default=24)
     args = parser.parse_args()
 
-    # Safety for multiprocessing in certain environments
     try: mp.set_start_method('spawn', force=True)
     except RuntimeError: pass
 
