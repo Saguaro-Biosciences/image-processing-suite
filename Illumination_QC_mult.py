@@ -12,89 +12,93 @@ import scipy.stats
 from tqdm import tqdm
 from queue import Empty
 
-# --- 1. QC Math Functions (Tri-State Diagnostic) ---
+# --- 1. QC Math Functions (V7: Quantization & Mag Logic) ---
 
-def calculate_diagnostic_slopes(image, channel_name):
+def calculate_v7_metrics(image, channel_name):
     """
-    Calculates 3 variations of the slope to identify the CellProfiler match.
+    V7 Diagnostic:
+    1. Slope_Quantized_8bit: Forces image into 256 bins (adds noise).
+    2. Slope_Theoretical_Power: Calculates (Slope_Magnitude * 2).
     """
     results = {}
     
     # --- Percent Maximal ---
-    # Calc on raw image
     if image.dtype == np.uint8: max_val = 255
     else: max_val = 65535
     pct_max = (np.sum(image >= max_val) / image.size) * 100
-    results[f'IQ_PctMax_{channel_name}'] = pct_max
+    results[f'ImageQuality_PercentMaximal_{channel_name}'] = pct_max
 
     try:
+        # Common Radial Setup
         h, w = image.shape
         max_r = int(min(h, w) / 2)
-        
-        # --- PREP 1: RAW SCALING (Current Method) ---
+        y, x = np.indices((h, w))
+        center_y, center_x = h // 2, w // 2
+        r_int = np.sqrt((x - center_x)**2 + (y - center_y)**2).astype(int)
+        r_flat = r_int.ravel()
+
+        # --- CANDIDATE 1: 8-BIT QUANTIZATION NOISE ---
+        # Convert 16-bit (0-65535) -> 8-bit (0-255) -> Float
+        # This adds "steps" that look like high-frequency noise
         if image.dtype == np.uint16:
-            img_raw = image.astype(float) / 65535.0
+            img_8bit = (image / 256).astype(np.uint8)
+            img_input = img_8bit.astype(float) / 255.0
+        elif image.dtype == np.uint8:
+            img_input = image.astype(float) / 255.0
         else:
-            img_raw = image.astype(float) / 255.0
-            
-        # --- PREP 2: MIN-MAX STRETCH (CellProfiler "Rescale" Method) ---
-        # Stretches the dynamic range to 0-1, amplifying noise floor
-        img_min = np.min(image)
-        img_max = np.max(image)
-        if img_max > img_min:
-            img_stretched = (image.astype(float) - img_min) / (img_max - img_min)
+            # Force quantization on float inputs too
+            img_input = ((image / image.max()) * 255).astype(np.uint8).astype(float) / 255.0
+
+        F = scipy.fft.fft2(img_input)
+        F_shifted = scipy.fft.fftshift(F)
+        power_spectrum = np.abs(F_shifted) ** 2
+        
+        # Radial Sum (Power)
+        p_flat = power_spectrum.ravel()
+        radial_sum = np.bincount(r_flat, weights=p_flat)
+        
+        # Slice & Regress
+        if len(radial_sum) > max_r:
+            vals = radial_sum[1:max_r+1]
+            freqs = np.arange(1, max_r + 1)
         else:
-            img_stretched = np.zeros_like(image, dtype=float)
+            vals = radial_sum[1:]
+            freqs = np.arange(1, len(radial_sum) + 1)
+            
+        valid = vals > 0
+        if np.sum(valid) > 2:
+            s_quant, _, _, _, _ = scipy.stats.linregress(np.log(freqs[valid]), np.log(vals[valid]))
+            results[f'Slope_Quant8bit_{channel_name}'] = s_quant
+        else:
+            results[f'Slope_Quant8bit_{channel_name}'] = np.nan
 
-        # Helper to calc slope
-        def get_slope(img_input, use_magnitude=False):
-            F = scipy.fft.fft2(img_input)
-            F_shifted = scipy.fft.fftshift(F)
+        # --- CANDIDATE 2: THEORETICAL POWER (Mag * 2) ---
+        # Based on your V6 result: Mag Slope (-0.75) * 2 = -1.5
+        # We calculate Magnitude Slope on the HIGH PRECISION image
+        img_raw = image.astype(float)
+        F_raw = scipy.fft.fft2(img_raw)
+        F_shifted_raw = scipy.fft.fftshift(F_raw)
+        mag_spectrum = np.abs(F_shifted_raw) # Note: NOT SQUARED
+        
+        m_flat = mag_spectrum.ravel()
+        radial_sum_mag = np.bincount(r_flat, weights=m_flat)
+        
+        if len(radial_sum_mag) > max_r:
+            vals_mag = radial_sum_mag[1:max_r+1]
+        else:
+            vals_mag = radial_sum_mag[1:]
             
-            if use_magnitude:
-                spectrum = np.abs(F_shifted) # Magnitude (|F|)
-            else:
-                spectrum = np.abs(F_shifted) ** 2 # Power (|F|^2)
-            
-            # Radial Sum
-            y, x = np.indices(img_input.shape)
-            center_y, center_x = img_input.shape[0] // 2, img_input.shape[1] // 2
-            r = np.sqrt((x - center_x)**2 + (y - center_y)**2).astype(int)
-            
-            r_flat = r.ravel()
-            p_flat = spectrum.ravel()
-            radial_sum = np.bincount(r_flat, weights=p_flat)
-            
-            # Slice valid range
-            if len(radial_sum) > max_r:
-                radial_sum = radial_sum[1:max_r+1]
-                freqs = np.arange(1, max_r + 1)
-            else:
-                radial_sum = radial_sum[1:]
-                freqs = np.arange(1, len(radial_sum) + 1)
-            
-            # Regression
-            valid = radial_sum > 0
-            if np.sum(valid) > 2:
-                s, _, _, _, _ = scipy.stats.linregress(np.log(freqs[valid]), np.log(radial_sum[valid]))
-                return s
-            return np.nan
-
-        # --- METRIC 1: RAW SUM (Baseline: -2.5) ---
-        results[f'Slope_Raw_{channel_name}'] = get_slope(img_raw, use_magnitude=False)
-
-        # --- METRIC 2: STRETCHED SUM (Hypothesis: -1.5) ---
-        results[f'Slope_Stretched_{channel_name}'] = get_slope(img_stretched, use_magnitude=False)
-
-        # --- METRIC 3: MAGNITUDE (Hypothesis: -1.25) ---
-        # (Calculating on raw image, as log-log slope is scale invariant, 
-        # but magnitude vs power changes slope by factor of 0.5)
-        results[f'Slope_Magnitude_{channel_name}'] = get_slope(img_raw, use_magnitude=True)
+        valid_mag = vals_mag > 0
+        if np.sum(valid_mag) > 2:
+            s_mag, _, _, _, _ = scipy.stats.linregress(np.log(freqs[valid_mag]), np.log(vals_mag[valid_mag]))
+            # MULTIPLY BY 2 to get "Theoretical Power Slope"
+            results[f'Slope_Theoretical_{channel_name}'] = s_mag * 2.0
+        else:
+            results[f'Slope_Theoretical_{channel_name}'] = np.nan
 
     except Exception:
-        results[f'Slope_Raw_{channel_name}'] = np.nan
-        results[f'Slope_Stretched_{channel_name}'] = np.nan
-        results[f'Slope_Magnitude_{channel_name}'] = np.nan
+        results[f'Slope_Quant8bit_{channel_name}'] = np.nan
+        results[f'Slope_Theoretical_{channel_name}'] = np.nan
 
     return results
 
@@ -102,7 +106,7 @@ def calculate_diagnostic_slopes(image, channel_name):
 
 def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path):
     if worker_id == 0:
-        print("--- WORKER STARTED: QC_V6_Diagnostic (Raw vs Stretched vs Mag) ---")
+        print("--- WORKER STARTED: V7 (8-bit Quantization vs Theoretical Power) ---")
 
     corrections = None
     if illum_path:
@@ -135,13 +139,12 @@ def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path
 
                 img = tifffile.imread(path)
                 
-                # Apply Illumination (Raw Division)
-                # Note: We apply stretch inside the calc function to test both
+                # Apply Illumination
                 if corrections and corrections[i] is not None:
                      if img.shape == corrections[i].shape:
                         img = img / corrections[i]
                 
-                metrics = calculate_diagnostic_slopes(img, ch_name)
+                metrics = calculate_v7_metrics(img, ch_name)
                 site_results.update(metrics)
             
             results_dict[index] = site_results
@@ -157,8 +160,8 @@ def main(args):
     
     df = pd.read_csv(args.load_data)
     
-    # SAFETY: Drop any existing test columns to ensure fresh data
-    cols_to_drop = [c for c in df.columns if 'Slope_' in c or 'IQ_' in c]
+    # SAFETY: Drop existing test columns
+    cols_to_drop = [c for c in df.columns if 'Slope_' in c]
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
 
@@ -176,7 +179,7 @@ def main(args):
     for t in tasks: task_queue.put(t)
     for _ in range(args.threads): task_queue.put(None)
 
-    logging.info(f"Starting QC V6 on {len(tasks)} sites...")
+    logging.info(f"Starting QC V7 on {len(tasks)} sites...")
     
     processes = []
     for i in range(args.threads):
@@ -208,7 +211,7 @@ if __name__ == '__main__':
     parser.add_argument('--data-path', type=str, required=True)
     parser.add_argument('--illum-path', type=str, default=None)
     parser.add_argument('--channels', nargs='+', required=True)
-    parser.add_argument('--output', type=str, default='QC_Results_V6.csv')
+    parser.add_argument('--output', type=str, default='QC_Results_V7.csv')
     parser.add_argument('--threads', type=int, default=24)
     args = parser.parse_args()
 
