@@ -17,7 +17,15 @@ from queue import Empty
 def calculate_cp_identical_slope(image, channel_name):
     """
     Replicates CellProfiler MeasureImageQuality PowerLogLogSlope.
-    METHOD: RADIAL SUM (Not Mean)
+    
+    ADJUSTMENT V4:
+    - Logic: Radial MEAN (PSD), not Sum.
+    - Range: FULL SPECTRUM (Includes Corners).
+    
+    Why? 
+    - Slope -2.5 (Previous) = Structural limit (Low Freq).
+    - Slope -1.4 (Target) = Structure + Noise (High Freq).
+    - We must include the corners (high freq noise) to flatten the slope.
     """
     results = {}
     
@@ -28,7 +36,7 @@ def calculate_cp_identical_slope(image, channel_name):
     pct_max = (np.sum(image >= max_val) / image.size) * 100
     results[f'ImageQuality_PercentMaximal_{channel_name}'] = pct_max
 
-    # --- PowerLogLogSlope (Radial Sum) ---
+    # --- PowerLogLogSlope (Mean + Full Range) ---
     try:
         # 1. FFT & Power Spectrum
         image_float = image.astype(float)
@@ -41,33 +49,43 @@ def calculate_cp_identical_slope(image, channel_name):
         center_y, center_x = h // 2, w // 2
         y, x = np.indices((h, w))
         r = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+        
+        # 3. Define Max Radius (INCLUDE CORNERS)
+        # Previous code stopped at min(h,w)//2.
+        # We now go to the full diagonal to capture high-freq noise.
         r_int = r.astype(int)
+        max_r = int(np.max(r_int))
         
-        # 3. Define Max Radius (Nyquist / Inscribed Circle)
-        # CRITICAL: CellProfiler stops at the edge of the circle.
-        max_r = int(min(h, w) / 2)
-        
-        # 4. Radial SUMMATION (This is the key fix)
-        # We use bincount with weights=power_spectrum to get the SUM.
-        # DO NOT DIVIDE by the pixel count.
+        # 4. Radial MEAN (PSD)
+        # We calculate Sum and Count, then divide.
         r_flat = r_int.ravel()
         p_flat = power_spectrum.ravel()
         
+        # Sum of power per ring
         radial_sum = np.bincount(r_flat, weights=p_flat)
+        # Count of pixels per ring
+        pixel_count = np.bincount(r_flat)
         
-        # 5. Filter Valid Range (1 to max_r)
-        if len(radial_sum) > max_r:
-            radial_sum = radial_sum[1:max_r+1]
-            freqs = np.arange(1, max_r + 1)
-        else:
-            radial_sum = radial_sum[1:]
-            freqs = np.arange(1, len(radial_sum) + 1)
+        # Handle cases where bincount is smaller than max_r (rare)
+        if len(radial_sum) < max_r + 1:
+            max_r = len(radial_sum) - 1
+            
+        # 5. Compute Mean (PSD)
+        # Avoid division by zero
+        valid_bins = pixel_count > 0
+        radial_mean = np.zeros_like(radial_sum)
+        radial_mean[valid_bins] = radial_sum[valid_bins] / pixel_count[valid_bins]
         
-        # 6. Log-Log Slope Calculation
-        valid_mask = radial_sum > 0
-        if np.sum(valid_mask) > 2:
-            freq_log = np.log(freqs[valid_mask])
-            power_log = np.log(radial_sum[valid_mask])
+        # 6. Select Range (Ignore DC at 0)
+        # We use the full valid range up to max_r
+        indices = np.arange(len(radial_mean))
+        
+        # Filter: Start at 1, go to max, ensure mean > 0
+        mask = (indices >= 1) & (indices <= max_r) & (radial_mean > 0)
+        
+        if np.sum(mask) > 10: # Ensure enough points for fit
+            freq_log = np.log(indices[mask])
+            power_log = np.log(radial_mean[mask])
             
             slope, _, _, _, _ = scipy.stats.linregress(freq_log, power_log)
             results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = slope
@@ -82,9 +100,8 @@ def calculate_cp_identical_slope(image, channel_name):
 # --- 2. Parallel Worker ---
 
 def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path):
-    # Print to verify new code is running
     if worker_id == 0:
-        print("--- DEBUG: WORKER RUNNING FIXED V3 (SUM) LOGIC ---")
+        print("--- DEBUG: WORKER RUNNING V4 (MEAN + CORNERS) LOGIC ---")
         
     corrections = None
     if illum_path:
@@ -134,9 +151,7 @@ def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path
 def main(args):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
     logging.info(f"Reading CSV: {args.load_data}")
-    
-    # Force print to log to verify version
-    logging.info("!!! VERSION CHECK: RUNNING V3 (SUM LOGIC) !!!")
+    logging.info("!!! VERSION CHECK: RUNNING V4 (MEAN + CORNERS) !!!")
     
     df = pd.read_csv(args.load_data)
     channel_cols = [f'FileName_{c}' for c in args.channels]
