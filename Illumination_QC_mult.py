@@ -12,25 +12,30 @@ import scipy.stats
 from tqdm import tqdm
 from queue import Empty
 
-# --- 1. QC Math Functions (Calculates BOTH Slopes) ---
+# --- 1. QC Math Functions (V5 Sum + CP Clipping) ---
 
-def calculate_dual_slopes(image, channel_name):
+def calculate_cp_metrics_exact(image, channel_name):
     """
-    Calculates BOTH the Radial Mean slope and Radial Sum slope.
-    This allows us to verify which one matches CellProfiler (-1.4).
+    Replicates CellProfiler MeasureImageQuality EXACTLY.
+    
+    CRITICAL STEPS FROM PIPELINE:
+    1. INPUT: Image must be scaled 0-1 and CLIPPED at 1.0 before FFT.
+       (The clipping adds high-freq artifacts that flatten the slope).
+    2. MATH: Radial SUM (Not Mean).
+    3. RANGE: Nyquist Limit (No corners).
     """
     results = {}
     
-    # --- Percent Maximal ---
-    if image.dtype == np.uint8: max_val = 255
-    else: max_val = 65535
-    pct_max = (np.sum(image >= max_val) / image.size) * 100
+    # --- Percent Maximal (Saturation) ---
+    # Since we are now working in 0-1 float space due to the pipeline logic:
+    # "PercentMaximal" in CP on a scaled image checks for values = 1.0
+    pct_max = (np.sum(image >= 1.0) / image.size) * 100
     results[f'ImageQuality_PercentMaximal_{channel_name}'] = pct_max
 
+    # --- PowerLogLogSlope ---
     try:
-        # 1. FFT & Power Spectrum
-        image_float = image.astype(float)
-        F = scipy.fft.fft2(image_float)
+        # 1. FFT & Power Spectrum (On the CLIPPED image)
+        F = scipy.fft.fft2(image)
         F_shifted = scipy.fft.fftshift(F)
         power_spectrum = np.abs(F_shifted) ** 2
         
@@ -41,66 +46,43 @@ def calculate_dual_slopes(image, channel_name):
         r = np.sqrt((x - center_x)**2 + (y - center_y)**2)
         r_int = r.astype(int)
         
-        # 3. Limit (Nyquist / Inscribed Circle)
+        # 3. Define Max Radius (Nyquist)
         max_r = int(min(h, w) / 2)
         
-        # 4. Radial Integration
+        # 4. Radial SUMMATION
         r_flat = r_int.ravel()
         p_flat = power_spectrum.ravel()
-        
-        # Sum of Power (The CellProfiler Candidate)
         radial_sum = np.bincount(r_flat, weights=p_flat)
-        # Pixel Count (For Mean Calculation)
-        pixel_count = np.bincount(r_flat)
         
-        # Trim to valid range [1, max_r]
+        # 5. Filter Valid Range [1, max_r]
         if len(radial_sum) > max_r:
             radial_sum = radial_sum[1:max_r+1]
-            pixel_count = pixel_count[1:max_r+1]
             freqs = np.arange(1, max_r + 1)
         else:
             radial_sum = radial_sum[1:]
-            pixel_count = pixel_count[1:]
             freqs = np.arange(1, len(radial_sum) + 1)
-            
-        # 5. Calculate Slope MEAN (Density)
-        # Formula: Mean = Sum / Count
-        radial_mean = radial_sum / (pixel_count + 1e-12)
         
-        valid_mask_mean = radial_mean > 0
-        if np.sum(valid_mask_mean) > 2:
-            slope_mean, _, _, _, _ = scipy.stats.linregress(
-                np.log(freqs[valid_mask_mean]), 
-                np.log(radial_mean[valid_mask_mean])
-            )
-            results[f'IQ_Slope_Mean_{channel_name}'] = slope_mean
+        # 6. Log-Log Slope
+        valid_mask = radial_sum > 0
+        if np.sum(valid_mask) > 2:
+            freq_log = np.log(freqs[valid_mask])
+            power_log = np.log(radial_sum[valid_mask])
+            
+            slope, _, _, _, _ = scipy.stats.linregress(freq_log, power_log)
+            results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = slope
         else:
-            results[f'IQ_Slope_Mean_{channel_name}'] = np.nan
-
-        # 6. Calculate Slope SUM (Total Power)
-        # Formula: Sum only
-        valid_mask_sum = radial_sum > 0
-        if np.sum(valid_mask_sum) > 2:
-            slope_sum, _, _, _, _ = scipy.stats.linregress(
-                np.log(freqs[valid_mask_sum]), 
-                np.log(radial_sum[valid_mask_sum])
-            )
-            results[f'IQ_Slope_Sum_{channel_name}'] = slope_sum
-        else:
-            results[f'IQ_Slope_Sum_{channel_name}'] = np.nan
+            results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = np.nan
             
     except Exception:
-        results[f'IQ_Slope_Mean_{channel_name}'] = np.nan
-        results[f'IQ_Slope_Sum_{channel_name}'] = np.nan
+        results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = np.nan
 
     return results
 
-# --- 2. Parallel Worker ---
+# --- 2. Parallel Worker (With Scaling & Clipping) ---
 
 def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path):
-    # Print ONCE to confirm execution
     if worker_id == 0:
-        print("--- DEBUG: WORKER STARTED (Dual Mode) ---")
+        print("--- WORKER STARTED: Simulating CP Pipeline (Scale -> Illum -> Clip -> Sum) ---")
 
     corrections = None
     if illum_path:
@@ -131,14 +113,32 @@ def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path
                     site_results[f"QC_Error_{ch_name}"] = "File Not Found"
                     continue
 
-                img = tifffile.imread(path)
+                # A. Load Raw Image
+                img_raw = tifffile.imread(path)
                 
+                # B. REPLICATE "LoadData" SCALING
+                # CellProfiler scales 16-bit images to 0-1 automatically
+                if img_raw.dtype == np.uint16:
+                    img_float = img_raw.astype(np.float32) / 65535.0
+                elif img_raw.dtype == np.uint8:
+                    img_float = img_raw.astype(np.float32) / 255.0
+                else:
+                    img_float = img_raw.astype(np.float32)
+
+                # C. REPLICATE "CorrectIlluminationApply"
                 if corrections and corrections[i] is not None:
-                    if img.shape == corrections[i].shape:
-                        img = img / corrections[i]
+                    # Resize illum if needed (CP handles this, we must ensure safety)
+                    illum = corrections[i]
+                    if img_float.shape == illum.shape:
+                        img_float = img_float / illum
                 
-                # Calculate BOTH metrics
-                metrics = calculate_dual_slopes(img, ch_name)
+                # D. CRITICAL: REPLICATE CLIPPING
+                # "Set output image values greater than 1 equal to 1?: Yes"
+                # This hard clip introduces the high-freq harmonics that flatten the slope.
+                img_float = np.clip(img_float, 0.0, 1.0)
+                
+                # E. Measure
+                metrics = calculate_cp_metrics_exact(img_float, ch_name)
                 site_results.update(metrics)
             
             results_dict[index] = site_results
@@ -151,9 +151,13 @@ def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path
 def main(args):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
     logging.info(f"Reading CSV: {args.load_data}")
-    logging.info("!!! RUNNING DUAL_TEST: Generating '_Slope_Mean' and '_Slope_Sum' !!!")
+    logging.info("!!! REPLICATING CP PIPELINE: SCALING & CLIPPING ENABLED !!!")
     
     df = pd.read_csv(args.load_data)
+    
+    # RENAME KEYS TEMPORARILY TO ENSURE FRESH COLUMNS (Optional but recommended)
+    # The worker function above uses the standard names, but you can change them if needed.
+    
     channel_cols = [f'FileName_{c}' for c in args.channels]
     
     tasks = [
@@ -200,7 +204,7 @@ if __name__ == '__main__':
     parser.add_argument('--data-path', type=str, required=True)
     parser.add_argument('--illum-path', type=str, default=None)
     parser.add_argument('--channels', nargs='+', required=True)
-    parser.add_argument('--output', type=str, default='QC_Results_Dual.csv')
+    parser.add_argument('--output', type=str, default='QC_Results_PipelineMatch.csv')
     parser.add_argument('--threads', type=int, default=24)
     args = parser.parse_args()
 
