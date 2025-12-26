@@ -12,30 +12,21 @@ import scipy.stats
 from tqdm import tqdm
 from queue import Empty
 
-# --- 1. QC Math Functions ---
+# --- 1. QC Math Functions (Calculates BOTH Slopes) ---
 
-def calculate_cp_identical_slope(image, channel_name):
+def calculate_dual_slopes(image, channel_name):
     """
-    Replicates CellProfiler MeasureImageQuality PowerLogLogSlope.
-    
-    METHOD: V5 (Final Correct Logic)
-    1. METRIC: Radial SUM (not Mean). 
-       (Adds +1.0 to slope compared to Mean).
-    2. RANGE: Exclude Corners (Stop at Nyquist).
-       (Prevents the -3.9 drop-off caused by optical cutoff).
-    
-    Expected Result: ~ -1.4 to -1.5
+    Calculates BOTH the Radial Mean slope and Radial Sum slope.
+    This allows us to verify which one matches CellProfiler (-1.4).
     """
     results = {}
     
-    # --- Percent Maximal (Saturation) ---
+    # --- Percent Maximal ---
     if image.dtype == np.uint8: max_val = 255
     else: max_val = 65535
-        
     pct_max = (np.sum(image >= max_val) / image.size) * 100
     results[f'ImageQuality_PercentMaximal_{channel_name}'] = pct_max
 
-    # --- PowerLogLogSlope (Sum + No Corners) ---
     try:
         # 1. FFT & Power Spectrum
         image_float = image.astype(float)
@@ -50,52 +41,67 @@ def calculate_cp_identical_slope(image, channel_name):
         r = np.sqrt((x - center_x)**2 + (y - center_y)**2)
         r_int = r.astype(int)
         
-        # 3. Define Max Radius (EXCLUDE CORNERS)
-        # We stop at the edge of the "inscribed circle".
-        # This removes the high-freq optical cutoff that steepened your slope to -3.9.
+        # 3. Limit (Nyquist / Inscribed Circle)
         max_r = int(min(h, w) / 2)
         
-        # 4. Radial SUMMATION (The +1.0 Slope Boost)
-        # We use bincount with weights=power_spectrum.
-        # This calculates SUM. (Mean would be Sum / Count).
+        # 4. Radial Integration
         r_flat = r_int.ravel()
         p_flat = power_spectrum.ravel()
         
+        # Sum of Power (The CellProfiler Candidate)
         radial_sum = np.bincount(r_flat, weights=p_flat)
+        # Pixel Count (For Mean Calculation)
+        pixel_count = np.bincount(r_flat)
         
-        # 5. Filter Valid Range (1 to max_r)
-        # We slice [1:max_r+1] to ignore DC (0) and Corners (>max_r)
+        # Trim to valid range [1, max_r]
         if len(radial_sum) > max_r:
             radial_sum = radial_sum[1:max_r+1]
+            pixel_count = pixel_count[1:max_r+1]
             freqs = np.arange(1, max_r + 1)
         else:
             radial_sum = radial_sum[1:]
+            pixel_count = pixel_count[1:]
             freqs = np.arange(1, len(radial_sum) + 1)
-        
-        # 6. Log-Log Slope Calculation
-        valid_mask = radial_sum > 0
-        if np.sum(valid_mask) > 2:
-            freq_log = np.log(freqs[valid_mask])
-            power_log = np.log(radial_sum[valid_mask])
             
-            slope, _, _, _, _ = scipy.stats.linregress(freq_log, power_log)
-            results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = slope
+        # 5. Calculate Slope MEAN (Density)
+        # Formula: Mean = Sum / Count
+        radial_mean = radial_sum / (pixel_count + 1e-12)
+        
+        valid_mask_mean = radial_mean > 0
+        if np.sum(valid_mask_mean) > 2:
+            slope_mean, _, _, _, _ = scipy.stats.linregress(
+                np.log(freqs[valid_mask_mean]), 
+                np.log(radial_mean[valid_mask_mean])
+            )
+            results[f'IQ_Slope_Mean_{channel_name}'] = slope_mean
         else:
-            results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = np.nan
+            results[f'IQ_Slope_Mean_{channel_name}'] = np.nan
+
+        # 6. Calculate Slope SUM (Total Power)
+        # Formula: Sum only
+        valid_mask_sum = radial_sum > 0
+        if np.sum(valid_mask_sum) > 2:
+            slope_sum, _, _, _, _ = scipy.stats.linregress(
+                np.log(freqs[valid_mask_sum]), 
+                np.log(radial_sum[valid_mask_sum])
+            )
+            results[f'IQ_Slope_Sum_{channel_name}'] = slope_sum
+        else:
+            results[f'IQ_Slope_Sum_{channel_name}'] = np.nan
             
     except Exception:
-        results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = np.nan
+        results[f'IQ_Slope_Mean_{channel_name}'] = np.nan
+        results[f'IQ_Slope_Sum_{channel_name}'] = np.nan
 
     return results
 
 # --- 2. Parallel Worker ---
 
 def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path):
-    # CRITICAL: If you do not see this print, the code was overwritten by git pull
+    # Print ONCE to confirm execution
     if worker_id == 0:
-        print("--- DEBUG: WORKER RUNNING V5 (SUM + NO CORNERS) LOGIC ---")
-        print("--- CHECK: This is the logic expected to produce ~ -1.4 ---")
-        
+        print("--- DEBUG: WORKER STARTED (Dual Mode) ---")
+
     corrections = None
     if illum_path:
         try:
@@ -131,7 +137,8 @@ def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path
                     if img.shape == corrections[i].shape:
                         img = img / corrections[i]
                 
-                metrics = calculate_cp_identical_slope(img, ch_name)
+                # Calculate BOTH metrics
+                metrics = calculate_dual_slopes(img, ch_name)
                 site_results.update(metrics)
             
             results_dict[index] = site_results
@@ -144,9 +151,7 @@ def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path
 def main(args):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
     logging.info(f"Reading CSV: {args.load_data}")
-    
-    # Version Verification Tag
-    logging.info("!!! VERSION CHECK: RUNNING V5 (SUM + NO CORNERS) !!!")
+    logging.info("!!! RUNNING DUAL_TEST: Generating '_Slope_Mean' and '_Slope_Sum' !!!")
     
     df = pd.read_csv(args.load_data)
     channel_cols = [f'FileName_{c}' for c in args.channels]
@@ -185,6 +190,7 @@ def main(args):
 
     qc_df = pd.DataFrame.from_dict(results_dict, orient='index').sort_index()
     final_df = pd.concat([df, qc_df], axis=1)
+    
     final_df.to_csv(args.output, index=False)
     logging.info(f"Saved to {args.output}")
 
@@ -194,7 +200,7 @@ if __name__ == '__main__':
     parser.add_argument('--data-path', type=str, required=True)
     parser.add_argument('--illum-path', type=str, default=None)
     parser.add_argument('--channels', nargs='+', required=True)
-    parser.add_argument('--output', type=str, default='QC_Results.csv')
+    parser.add_argument('--output', type=str, default='QC_Results_Dual.csv')
     parser.add_argument('--threads', type=int, default=24)
     args = parser.parse_args()
 
