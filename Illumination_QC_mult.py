@@ -6,82 +6,93 @@ import tifffile
 import pandas as pd
 import numpy as np
 import torch.multiprocessing as mp
-from scipy import fftpack
+import scipy.fft
+import scipy.ndimage
+import scipy.stats
 from tqdm import tqdm
 from queue import Empty
 
-# --- 1. QC Math Functions (CP Matched: Magnitude + Full Range) ---
+# --- 1. QC Math Functions (CP Matched: PowerLogLogSlope + PercentMaximal) ---
 
-import numpy as np
-from scipy import fftpack
-
-def calculate_cp_identical_slope(image, channel_name, bit_depth=16):
+def calculate_cp_identical_slope(image, channel_name):
     """
-    Calculates QC metrics exactly matching CellProfiler's logic.
+    Calculates QC metrics replicating CellProfiler's MeasureImageQuality logic.
     
-    FINAL ADJUSTMENT:
-    - Includes the FFT CORNERS in the radial average.
-    - The corners contain high-frequency noise that flattens the slope 
-      from -1.75 to ~ -1.4.
+    1. Percent Maximal: Checks for saturation (specifically for 16-bit images).
+    2. PowerLogLogSlope: FFT -> Power Spectrum -> Radial Sum -> Log-Log Slope.
     """
     results = {}
     
-    # 1. Percent Maximal (Saturation)
-    if image.dtype == np.uint8: max_val = 255
-    elif image.dtype == np.uint16: max_val = 65535
-    else: max_val = (2**bit_depth) - 1
+    # --- 1. Percent Maximal (Saturation for 16-bit) ---
+    # CellProfiler MeasureImageQuality "PercentMaximal" is the percentage of pixels 
+    # at the maximum possible value of the bit-depth.
+    
+    # Determine max value based on dtype, defaulting to 16-bit (65535) if unsure
+    if image.dtype == np.uint8:
+        max_val = 255
+    elif image.dtype == np.uint16:
+        max_val = 65535
+    else:
+        # Fallback for floating point or other types: assume standard 16-bit range or 1.0
+        max_val = 65535 if image.max() > 1.0 else 1.0
         
-    pct_max = (np.sum(image >= max_val) / image.size) * 100
-    results[f'ImageQuality_PercentMaximal_Corr{channel_name}'] = pct_max
+    num_saturated = np.sum(image >= max_val)
+    pct_max = (num_saturated / image.size) * 100
+    results[f'ImageQuality_PercentMaximal_{channel_name}'] = pct_max
 
-    # 2. PowerLogLog Slope (Magnitude + Full Range + Corners)
+    # --- 2. PowerLogLogSlope (CellProfiler Logic) ---
     try:
-        # Convert to float
-        img_float = image.astype(np.float32)
+        # Ensure image is float for FFT
+        image_float = image.astype(float)
         
-        # FFT & Magnitude
-        F = fftpack.fft2(img_float)
-        F_shifted = fftpack.fftshift(F)
-        magnitude_spectrum = np.abs(F_shifted)
+        # A. Compute the 2D Fast Fourier Transform
+        f_transform = scipy.fft.fft2(image_float)
         
-        # Radial Averaging
-        h, w = img_float.shape
-        y, x = np.indices(magnitude_spectrum.shape)
-        center = (h // 2, w // 2)
+        # B. Shift zero-frequency component to center
+        f_shifted = scipy.fft.fftshift(f_transform)
         
-        # Calculate distance to center for EVERY pixel, including corners
-        r = np.sqrt((x - center[0])**2 + (y - center[1])**2).astype(int)
-
-        tbin = np.bincount(r.ravel(), magnitude_spectrum.ravel())
-        nr = np.bincount(r.ravel())
-        radial_profile = tbin / (nr + 1e-10)
+        # C. Calculate Power Spectrum (Magnitude squared)
+        # Note: CellProfiler calculates Power = |F|^2
+        power_spectrum = np.abs(f_shifted) ** 2
         
-        # --- THE FIX: GO TO THE CORNERS ---
-        # Previous: max_r = min(center)  (Stops at the edges)
-        # New:      max_r = max(r.ravel()) (Goes to the furthest corner)
+        # D. Radial Integration Setup
+        h, w = image.shape
+        center_y, center_x = h // 2, w // 2
         
-        max_r = np.max(r) # This includes the noise-heavy corners
+        y, x = np.indices((h, w))
+        r = np.sqrt((x - center_x)**2 + (y - center_y)**2)
         
-        # CellProfiler typically fits the whole valid range starting after DC
-        start_idx = 1
-        end_idx = int(max_r)
+        # Convert radii to integer indices for binning
+        r_int = r.astype(int)
         
-        if end_idx > start_idx:
-            freqs = np.arange(start_idx, end_idx)
+        # Define max radius (Nyquist limit / half-width of smallest dimension)
+        # This matches standard CellProfiler behavior which avoids corner artifacts.
+        max_r = min(h, w) // 2
+        
+        # E. Sum power spectrum intensity within each ring
+        # We integrate from radius 1 to max_r (ignoring DC component at 0)
+        tbin = np.arange(1, max_r + 1)
+        
+        # Efficient labeled sum using scipy.ndimage
+        radial_power = scipy.ndimage.sum(power_spectrum, r_int, index=tbin)
+        
+        # F. Filter valid values for Log-Log
+        # Ensure we don't take log of zero
+        valid_mask = radial_power > 0
+        if np.sum(valid_mask) > 2: # Need at least a few points for regression
+            freq_log = np.log(tbin[valid_mask])
+            power_log = np.log(radial_power[valid_mask])
             
-            # Check for valid data range to avoid indexing errors
-            valid_profile = radial_profile[start_idx:end_idx]
-            
-            log_x = np.log(freqs)
-            log_y = np.log(valid_profile + 1e-10)
-            
-            slope, _ = np.polyfit(log_x, log_y, 1)
-            results[f'ImageQuality_PowerLogLogSlope_Corr{channel_name}'] = slope
+            # G. Linear Regression
+            # Returns: slope, intercept, r_value, p_value, std_err
+            slope, _, _, _, _ = scipy.stats.linregress(freq_log, power_log)
+            results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = slope
         else:
-            results[f'ImageQuality_PowerLogLogSlope_Corr{channel_name}'] = np.nan
+            results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = np.nan
             
-    except Exception:
-        results[f'ImageQuality_PowerLogLogSlope_Corr{channel_name}'] = np.nan
+    except Exception as e:
+        # logging.error(f"Error calculating slope for {channel_name}: {e}") # Optional debug
+        results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = np.nan
 
     return results
 
@@ -111,8 +122,11 @@ def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path
 
                 img = tifffile.imread(path)
                 
+                # Apply Illumination Correction if loaded
                 if corrections is not None:
-                    img = img / corrections[i]
+                    # Ensure dimensions match before division
+                    if img.shape == corrections[i].shape:
+                        img = img / corrections[i]
                 
                 metrics = calculate_cp_identical_slope(img, ch_name)
                 site_results.update(metrics)
@@ -130,8 +144,16 @@ def main(args):
     
     logging.info(f"Reading input CSV: {args.load_data}")
     df = pd.read_csv(args.load_data)
+    
+    # Construct expected column names for file paths
     channel_cols = [f'FileName_{c}' for c in args.channels]
     
+    # verify columns exist
+    for col in channel_cols:
+        if col not in df.columns:
+            logging.error(f"Column {col} not found in CSV. Check your --channels argument.")
+            return
+
     tasks = [
         (idx, [os.path.join(args.data_path, row[col]) for col in channel_cols])
         for idx, row in df.iterrows()
@@ -176,14 +198,15 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--load-data', type=str, required=True)
-    parser.add_argument('--data-path', type=str, required=True)
-    parser.add_argument('--illum-path', type=str, default=None)
-    parser.add_argument('--channels', nargs='+', required=True)
+    parser.add_argument('--load-data', type=str, required=True, help='Path to CSV containing image filenames')
+    parser.add_argument('--data-path', type=str, required=True, help='Base path where images are stored')
+    parser.add_argument('--illum-path', type=str, default=None, help='Path to folder containing numpy illumination functions')
+    parser.add_argument('--channels', nargs='+', required=True, help='List of channel names (e.g. DAPI GFP)')
     parser.add_argument('--output', type=str, default='QC_Results.csv')
     parser.add_argument('--threads', type=int, default=24)
     args = parser.parse_args()
 
+    # Safety for multiprocessing in certain environments
     try: mp.set_start_method('spawn', force=True)
     except RuntimeError: pass
 
