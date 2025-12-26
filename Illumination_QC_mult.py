@@ -42,46 +42,58 @@ def calculate_cp_identical_slope(image, channel_name):
 
     # --- 2. PowerLogLogSlope (CellProfiler Logic) ---
     try:
-        # Ensure image is float for FFT
+        # A. FFT and Shift
+        # CellProfiler casts to float before FFT
         image_float = image.astype(float)
+        F = scipy.fft.fft2(image_float)
+        F_shifted = scipy.fft.fftshift(F)
         
-        # A. Compute the 2D Fast Fourier Transform
-        f_transform = scipy.fft.fft2(image_float)
+        # B. Power Spectrum (Magnitude Squared)
+        # CP uses |F|^2. 
+        power_spectrum = np.abs(F_shifted) ** 2
         
-        # B. Shift zero-frequency component to center
-        f_shifted = scipy.fft.fftshift(f_transform)
-        
-        # C. Calculate Power Spectrum (Magnitude squared)
-        # Note: CellProfiler calculates Power = |F|^2
-        power_spectrum = np.abs(f_shifted) ** 2
-        
-        # D. Radial Integration Setup
+        # C. Radial Summation Setup
         h, w = image.shape
         center_y, center_x = h // 2, w // 2
-        
         y, x = np.indices((h, w))
-        r = np.sqrt((x - center_x)**2 + (y - center_y)**2)
         
-        # Convert radii to integer indices for binning
+        # Calculate distances
+        r = np.sqrt((x - center_x)**2 + (y - center_y)**2)
         r_int = r.astype(int)
         
-        # Define max radius (Nyquist limit / half-width of smallest dimension)
-        # This matches standard CellProfiler behavior which avoids corner artifacts.
-        max_r = min(h, w) // 2
+        # D. Define Max Radius (Exclude Corners)
+        # CellProfiler stops at the edge of the inscribed circle.
+        # Including corners would cause the Sum to drop artificially, steeping the slope.
+        max_r = int(min(h, w) / 2)
         
-        # E. Sum power spectrum intensity within each ring
-        # We integrate from radius 1 to max_r (ignoring DC component at 0)
-        tbin = np.arange(1, max_r + 1)
+        # E. Calculate Radial Sum
+        # We use bincount for speed, but DO NOT divide by the count (nr).
+        # We only care about bins 1 to max_r (ignoring DC at 0)
         
-        # Efficient labeled sum using scipy.ndimage
-        radial_power = scipy.ndimage.sum(power_spectrum, r_int, index=tbin)
+        # Flatten arrays for bincount
+        r_flat = r_int.ravel()
+        p_flat = power_spectrum.ravel()
+        
+        # Calculate Sum of Power in each ring
+        # weights=p_flat ensures we sum the power values
+        radial_sum = np.bincount(r_flat, weights=p_flat)
+        
+        # Slice to valid range [1, max_r]
+        # We start at 1 to ignore DC component
+        if len(radial_sum) > max_r:
+            radial_sum = radial_sum[1:max_r+1]
+            freqs = np.arange(1, max_r + 1)
+        else:
+            # Fallback if image is tiny
+            radial_sum = radial_sum[1:]
+            freqs = np.arange(1, len(radial_sum) + 1)
         
         # F. Filter valid values for Log-Log
-        # Ensure we don't take log of zero
-        valid_mask = radial_power > 0
-        if np.sum(valid_mask) > 2: # Need at least a few points for regression
-            freq_log = np.log(tbin[valid_mask])
-            power_log = np.log(radial_power[valid_mask])
+        valid_mask = radial_sum > 0
+        
+        if np.sum(valid_mask) > 2:
+            freq_log = np.log(freqs[valid_mask])
+            power_log = np.log(radial_sum[valid_mask])
             
             # G. Linear Regression
             # Returns: slope, intercept, r_value, p_value, std_err
@@ -91,7 +103,6 @@ def calculate_cp_identical_slope(image, channel_name):
             results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = np.nan
             
     except Exception as e:
-        # logging.error(f"Error calculating slope for {channel_name}: {e}") # Optional debug
         results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = np.nan
 
     return results
