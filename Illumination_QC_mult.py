@@ -1,221 +1,229 @@
 import os
 import argparse
 import logging
-import time
 import tifffile
-import pandas as pd
 import numpy as np
-import torch.multiprocessing as mp
-import scipy.fft
+import pandas as pd
+import scipy.fftpack
 import scipy.ndimage
 import scipy.stats
+import concurrent.futures
 from tqdm import tqdm
-from queue import Empty
 
-# --- 1. QC Math Functions (V7: Quantization & Mag Logic) ---
+# ==========================================
+# 1. ARGUMENT PARSING
+# ==========================================
 
-def calculate_v7_metrics(image, channel_name):
+def parse_args():
+    parser = argparse.ArgumentParser(description="CellProfiler-Matched Image QC (Production)")
+    parser.add_argument('--load-data', type=str, required=True, help="Path to input CSV (LoadData format)")
+    parser.add_argument('--data-path', type=str, required=True, help="Base path for image files")
+    parser.add_argument('--illum-path', type=str, default=None, help="Folder containing .npy illumination functions")
+    parser.add_argument('--channels', nargs='+', required=True, help="List of channel names (e.g. CL488 CL568)")
+    parser.add_argument('--output', type=str, default='QC_Results.csv', help="Path for output CSV")
+    parser.add_argument('--threads', type=int, default=24, help="Number of threads for parallel processing")
+    return parser.parse_args()
+
+# ==========================================
+# 2. EXACT MATH FUNCTIONS (FROM SOURCE)
+# ==========================================
+
+def rps(img):
     """
-    V7 Diagnostic:
-    1. Slope_Quantized_8bit: Forces image into 256 bins (adds noise).
-    2. Slope_Theoretical_Power: Calculates (Slope_Magnitude * 2).
+    Exact implementation of centrosome.radial_power_spectrum.rps
+    Source: CellProfiler/Centrosome
+    """
+    assert img.ndim == 2
+    
+    # 1. Quadrant Folding (Radii calculation for unshifted FFT)
+    radii2 = (np.arange(img.shape[0]).reshape((img.shape[0], 1)) ** 2) + (
+        np.arange(img.shape[1]) ** 2
+    )
+    radii2 = np.minimum(radii2, np.flipud(radii2))
+    radii2 = np.minimum(radii2, np.fliplr(radii2))
+    
+    # 2. Truncation (The Critical Difference from standard PSD)
+    # Only analyzes low frequencies (up to width/8).
+    # For a 256px image, maxwidth is 32. This excludes high-freq noise.
+    maxwidth = (min(img.shape[0], img.shape[1]) / 8.0)
+    
+    # 3. Intensity Invariant Normalization
+    # Updated for NumPy 2.0 compatibility (np.ptp instead of img.ptp)
+    if np.ptp(img) > 0:
+        img = img / np.median(np.abs(img - np.mean(img)))
+        
+    # 4. FFT (DC removed)
+    # fft2 returns unshifted array (DC at 0,0)
+    mag = np.abs(scipy.fftpack.fft2(img - np.mean(img)))
+    power = mag ** 2
+    
+    # 5. Binning
+    radii = np.floor(np.sqrt(radii2)).astype(int) + 1
+    labels = np.arange(2, np.floor(maxwidth)).astype(int).tolist() # Skip DC (0) and Freq 1
+    
+    if len(labels) > 0:
+        # Sum power in each frequency ring
+        magsum = scipy.ndimage.sum(mag, radii, labels)
+        powersum = scipy.ndimage.sum(power, radii, labels)
+        return np.array(labels), np.array(magsum), np.array(powersum)
+    
+    return [2], [0], [0]
+
+
+def calculate_saturation_cp_exact(image, mask=None):
+    """
+    Exact implementation of CellProfiler saturation logic.
+    Calculates PercentMaximal based on the image's own maximum value.
+    """
+    # Handle Masking if present
+    if mask is not None:
+        pixel_data = image[mask]
+    else:
+        pixel_data = image
+
+    pixel_count = pixel_data.size
+    
+    if pixel_count == 0:
+        return 0.0
+    
+    # Logic: Count pixels equal to the maximum value found in the array
+    max_val = np.max(pixel_data)
+    number_pixels_maximal = np.sum(pixel_data == max_val)
+    
+    percent_maximal = (100.0 * float(number_pixels_maximal) / float(pixel_count))
+    
+    return percent_maximal
+
+
+def calculate_qc_metrics(image, channel_name):
+    """
+    Wrapper to run both RPS and Saturation checks.
     """
     results = {}
     
-    # --- Percent Maximal ---
-    if image.dtype == np.uint8: max_val = 255
-    else: max_val = 65535
-    pct_max = (np.sum(image >= max_val) / image.size) * 100
-    results[f'ImageQuality_PercentMaximal_{channel_name}'] = pct_max
-
+    # --- 1. PowerLogLogSlope (Using RPS) ---
     try:
-        # Common Radial Setup
-        h, w = image.shape
-        max_r = int(min(h, w) / 2)
-        y, x = np.indices((h, w))
-        center_y, center_x = h // 2, w // 2
-        r_int = np.sqrt((x - center_x)**2 + (y - center_y)**2).astype(int)
-        r_flat = r_int.ravel()
-
-        # --- CANDIDATE 1: 8-BIT QUANTIZATION NOISE ---
-        # Convert 16-bit (0-65535) -> 8-bit (0-255) -> Float
-        # This adds "steps" that look like high-frequency noise
-        if image.dtype == np.uint16:
-            img_8bit = (image / 256).astype(np.uint8)
-            img_input = img_8bit.astype(float) / 255.0
-        elif image.dtype == np.uint8:
-            img_input = image.astype(float) / 255.0
-        else:
-            # Force quantization on float inputs too
-            img_input = ((image / image.max()) * 255).astype(np.uint8).astype(float) / 255.0
-
-        F = scipy.fft.fft2(img_input)
-        F_shifted = scipy.fft.fftshift(F)
-        power_spectrum = np.abs(F_shifted) ** 2
+        radii, magsum, powersum = rps(image)
         
-        # Radial Sum (Power)
-        p_flat = power_spectrum.ravel()
-        radial_sum = np.bincount(r_flat, weights=p_flat)
-        
-        # Slice & Regress
-        if len(radial_sum) > max_r:
-            vals = radial_sum[1:max_r+1]
-            freqs = np.arange(1, max_r + 1)
-        else:
-            vals = radial_sum[1:]
-            freqs = np.arange(1, len(radial_sum) + 1)
-            
-        valid = vals > 0
+        valid = powersum > 0
         if np.sum(valid) > 2:
-            s_quant, _, _, _, _ = scipy.stats.linregress(np.log(freqs[valid]), np.log(vals[valid]))
-            results[f'Slope_Quant8bit_{channel_name}'] = s_quant
+            # CellProfiler uses Least Squares (lstsq), equivalent to linregress for 1D
+            slope, _, _, _, _ = scipy.stats.linregress(np.log(radii[valid]), np.log(powersum[valid]))
+            results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = slope
         else:
-            results[f'Slope_Quant8bit_{channel_name}'] = np.nan
-
-        # --- CANDIDATE 2: THEORETICAL POWER (Mag * 2) ---
-        # Based on your V6 result: Mag Slope (-0.75) * 2 = -1.5
-        # We calculate Magnitude Slope on the HIGH PRECISION image
-        img_raw = image.astype(float)
-        F_raw = scipy.fft.fft2(img_raw)
-        F_shifted_raw = scipy.fft.fftshift(F_raw)
-        mag_spectrum = np.abs(F_shifted_raw) # Note: NOT SQUARED
-        
-        m_flat = mag_spectrum.ravel()
-        radial_sum_mag = np.bincount(r_flat, weights=m_flat)
-        
-        if len(radial_sum_mag) > max_r:
-            vals_mag = radial_sum_mag[1:max_r+1]
-        else:
-            vals_mag = radial_sum_mag[1:]
-            
-        valid_mag = vals_mag > 0
-        if np.sum(valid_mag) > 2:
-            s_mag, _, _, _, _ = scipy.stats.linregress(np.log(freqs[valid_mag]), np.log(vals_mag[valid_mag]))
-            # MULTIPLY BY 2 to get "Theoretical Power Slope"
-            results[f'Slope_Theoretical_{channel_name}'] = s_mag * 2.0
-        else:
-            results[f'Slope_Theoretical_{channel_name}'] = np.nan
-
+            results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = 0.0
     except Exception:
-        results[f'Slope_Quant8bit_{channel_name}'] = np.nan
-        results[f'Slope_Theoretical_{channel_name}'] = np.nan
+        results[f'ImageQuality_PowerLogLogSlope_{channel_name}'] = np.nan
+
+    # --- 2. PercentMaximal (Using CP Logic) ---
+    try:
+        pct_max = calculate_saturation_cp_exact(image)
+        results[f'ImageQuality_PercentMaximal_{channel_name}'] = pct_max
+    except Exception:
+        results[f'ImageQuality_PercentMaximal_{channel_name}'] = np.nan
 
     return results
 
-# --- 2. Worker ---
+# ==========================================
+# 3. WORKER & ORCHESTRATOR
+# ==========================================
 
-def qc_producer_worker(task_queue, results_dict, worker_id, channels, illum_path):
-    if worker_id == 0:
-        print("--- WORKER STARTED: V7 (8-bit Quantization vs Theoretical Power) ---")
+def process_site(site_data):
+    """
+    Worker function to process a single site (row).
+    """
+    index, paths, channels, illum_cache = site_data
+    site_results = {}
 
-    corrections = None
-    if illum_path:
+    for i, (path, ch_name) in enumerate(zip(paths, channels)):
         try:
-            corrections = []
-            for c in channels:
-                c_path = os.path.join(illum_path, f"{c}_illum.npy")
-                if os.path.exists(c_path):
-                    corrections.append(np.load(c_path))
-                else:
-                    corrections.append(None)
-        except Exception:
-            pass
+            if not os.path.exists(path):
+                site_results[f"QC_Error_{ch_name}"] = "File Not Found"
+                continue
 
-    while True:
-        try:
-            task = task_queue.get(timeout=2)
-        except Empty:
-            break
-        if task is None: break
-
-        index, paths = task
-        site_results = {}
-
-        try:
-            for i, (path, ch_name) in enumerate(zip(paths, channels)):
-                if not os.path.exists(path):
-                    site_results[f"QC_Error_{ch_name}"] = "File Not Found"
-                    continue
-
-                img = tifffile.imread(path)
-                
-                # Apply Illumination
-                if corrections and corrections[i] is not None:
-                     if img.shape == corrections[i].shape:
-                        img = img / corrections[i]
-                
-                metrics = calculate_v7_metrics(img, ch_name)
-                site_results.update(metrics)
+            # Load Image
+            img = tifffile.imread(path).astype(float)
             
-            results_dict[index] = site_results
-
+            # Apply Illumination Correction
+            if illum_cache and illum_cache[i] is not None:
+                if img.shape == illum_cache[i].shape:
+                    img = img / illum_cache[i]
+                else:
+                    # Fallback to raw if shape mismatch
+                    pass 
+            
+            # Calculate Metrics
+            metrics = calculate_qc_metrics(img, ch_name)
+            site_results.update(metrics)
+            
         except Exception as e:
-            results_dict[index] = {f"QC_Error": str(e)}
+            site_results[f"QC_Error_{ch_name}"] = str(e)
+            
+    return index, site_results
 
-# --- 3. Orchestrator ---
 
-def main(args):
+def main():
+    args = parse_args()
+    
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
     logging.info(f"Reading CSV: {args.load_data}")
     
     df = pd.read_csv(args.load_data)
     
-    # SAFETY: Drop existing test columns
-    cols_to_drop = [c for c in df.columns if 'Slope_' in c]
+    # Clean up old QC columns
+    cols_to_drop = [c for c in df.columns if 'ImageQuality_' in c or 'QC_Error' in c]
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
 
     channel_cols = [f'FileName_{c}' for c in args.channels]
     
-    tasks = [
-        (idx, [os.path.join(args.data_path, row[col]) for col in channel_cols])
-        for idx, row in df.iterrows()
-    ]
+    # --- PRE-LOAD ILLUMINATION ---
+    logging.info("Loading Illumination Correction Files...")
+    illum_cache = []
+    if args.illum_path:
+        for c in args.channels:
+            # Try standard naming patterns
+            p1 = os.path.join(args.illum_path, f"{c}_illum.npy")
+            p2 = os.path.join(args.illum_path, f"Illum{c}.npy")
+            
+            if os.path.exists(p1):
+                illum_cache.append(np.load(p1))
+                logging.info(f"  Loaded {c}_illum.npy")
+            elif os.path.exists(p2):
+                illum_cache.append(np.load(p2))
+                logging.info(f"  Loaded Illum{c}.npy")
+            else:
+                illum_cache.append(None)
+                logging.warning(f"  Warning: No illumination file found for {c}")
+    else:
+        illum_cache = [None] * len(args.channels)
 
-    manager = mp.Manager()
-    results_dict = manager.dict()
-    task_queue = mp.Queue()
+    # --- PREPARE TASKS ---
+    tasks = []
+    for idx, row in df.iterrows():
+        paths = [os.path.join(args.data_path, row[col]) for col in channel_cols]
+        tasks.append((idx, paths, args.channels, illum_cache))
 
-    for t in tasks: task_queue.put(t)
-    for _ in range(args.threads): task_queue.put(None)
-
-    logging.info(f"Starting QC V7 on {len(tasks)} sites...")
+    logging.info(f"Starting processing on {len(tasks)} sites with {args.threads} threads...")
     
-    processes = []
-    for i in range(args.threads):
-        p = mp.Process(target=qc_producer_worker, 
-                       args=(task_queue, results_dict, i, args.channels, args.illum_path))
-        p.start()
-        processes.append(p)
+    # --- EXECUTE PARALLEL ---
+    results_dict = {}
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = {executor.submit(process_site, t): t[0] for t in tasks}
+        
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(tasks)):
+            idx, res = future.result()
+            results_dict[idx] = res
 
-    with tqdm(total=len(tasks)) as pbar:
-        while True:
-            completed = len(results_dict)
-            pbar.n = completed
-            pbar.refresh()
-            if completed >= len(tasks): break
-            if not any(p.is_alive() for p in processes) and completed < len(tasks): break
-            time.sleep(1)
-
-    for p in processes: p.join()
-
+    # --- MERGE & SAVE ---
+    logging.info("Merging results...")
     qc_df = pd.DataFrame.from_dict(results_dict, orient='index').sort_index()
+    
     final_df = pd.concat([df, qc_df], axis=1)
     
     final_df.to_csv(args.output, index=False)
-    logging.info(f"Saved to {args.output}")
+    logging.info(f"Done! Saved to {args.output}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--load-data', type=str, required=True)
-    parser.add_argument('--data-path', type=str, required=True)
-    parser.add_argument('--illum-path', type=str, default=None)
-    parser.add_argument('--channels', nargs='+', required=True)
-    parser.add_argument('--output', type=str, default='QC_Results_V7.csv')
-    parser.add_argument('--threads', type=int, default=24)
-    args = parser.parse_args()
-
-    try: mp.set_start_method('spawn', force=True)
-    except RuntimeError: pass
-
-    main(args)
+    main()
