@@ -45,9 +45,6 @@ def scale_to_8bit(image_16bit):
 def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key): 
     """ 
     Producer Process: Handles CPU-bound I/O tasks ONLY. 
-    - Fetches a site task from the task_queue. 
-    - Loads the 4-channel image from disk. 
-    - Places the raw image array into the data_queue for the consumer. 
     """ 
     logging.info(f"Producer-{worker_id} started.") 
     if csv_image_key:
@@ -56,7 +53,6 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
             logging.info(f"Producer-{worker_id} loaded correction arrays.")
         except Exception as e:
             logging.error(f"Producer-{worker_id} FAILED to load correction arrays: {e}")
-            # If loading fails, this worker can't do anything.
             return
 
     while True: 
@@ -70,28 +66,22 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
             try: 
                 all_channels = [tifffile.imread(path)/channel_correction[n] for n,path in enumerate(site_image_paths)] 
                 image_4ch = np.stack(all_channels, axis=-1) 
-                
-                # Put the raw image data onto the queue for the GPU worker 
                 data_queue.put((site_id, image_4ch)) 
 
             except Exception as e: 
                 logging.error(f"Producer-{worker_id} failed on site {site_id}: {e}") 
-                # Put a placeholder to signal completion even on failure 
                 data_queue.put((site_id, None)) 
         else:
             try: 
                 all_channels = [tifffile.imread(path) for path in site_image_paths] 
                 image_4ch = np.stack(all_channels, axis=-1) 
-                
-                # Put the raw image data onto the queue for the GPU worker 
                 data_queue.put((site_id, image_4ch)) 
 
             except Exception as e: 
                 logging.error(f"Producer-{worker_id} failed on site {site_id}: {e}") 
-                # Put a placeholder to signal completion even on failure 
                 data_queue.put((site_id, None))
 
-def consumer_worker(data_queue, results_dict, stop_event, worker_id,expected_n_channels, gpu_id=0): 
+def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels, gpu_id=0, single_cell_mode=False): 
     import os
     import gc 
     
@@ -102,7 +92,7 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id,expected_n_c
     from cellpose import models 
     from transformers import AutoImageProcessor, AutoModel
     
-    logging.info(f"Consumer-{worker_id} started. Physical GPU: {gpu_id} -> Mapped to cuda:{internal_device_id}") 
+    logging.info(f"Consumer-{worker_id} started. Physical GPU: {gpu_id} -> Mapped to cuda:{internal_device_id} | Single Cell Mode: {single_cell_mode}") 
     
     device = torch.device(f"cuda:{internal_device_id}" if torch.cuda.is_available() else "cpu") 
     
@@ -115,34 +105,33 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id,expected_n_c
     feature_model = AutoModel.from_pretrained(MODEL_NAME).to(device).eval() 
     
     half_box = BOX_SIZE // 2 
-    
-    # =========================================================================
-    # CHANGE 1: Initialize Batch Size OUTSIDE the loop
-    # The worker "learns" the safe limit and keeps it for future images.
-    # =========================================================================
     current_batch_size = INFERENCE_BATCH_SIZE 
+
+    # Helper for empty return
+    def return_empty_result(s_id):
+        if single_cell_mode:
+            # Return empty array with shape (0, n_ch, feat)
+            results_dict[s_id] = (np.zeros((0, expected_n_channels, FEATURE_LENGTH), dtype=np.float32), 0)
+        else:
+            # Return zero vector for site aggregation
+            results_dict[s_id] = (np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32), 0)
 
     while not stop_event.is_set(): 
         try: 
             item = data_queue.get(timeout=1) 
             site_id, image_4ch = item 
             
-            # --- CRITICAL FIX: Enforce Shape Consistency ---
-            
-            # Case A: Producer failed to load image entirely
+            # --- Shape Consistency ---
             if image_4ch is None: 
-                logging.warning(f"Consumer-{worker_id}: [ERROR] Site {site_id} is None (Producer load failure). Returning empty placeholder.")
-                # Return placeholder with CORRECT shape (expected_n_channels, 1280)
-                results_dict[site_id] = (np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32), 0) 
+                logging.warning(f"Consumer-{worker_id}: [ERROR] Site {site_id} is None. Returning placeholder.")
+                return_empty_result(site_id)
                 continue 
 
-            # Case B: Image loaded, but channel count is wrong (e.g., corrupt file)
             if image_4ch.shape[-1] != expected_n_channels:
-                logging.error(f"Consumer-{worker_id}: [ERROR] Site {site_id} has wrong shape. Got {image_4ch.shape}, expected last dim {expected_n_channels}. Skipping.")
-                results_dict[site_id] = (np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32), 0) 
+                logging.error(f"Consumer-{worker_id}: [ERROR] Site {site_id} has wrong shape {image_4ch.shape}. Skipping.")
+                return_empty_result(site_id)
                 continue
             
-            # Valid execution
             n_channels = expected_n_channels
             
             # --- 1. Run Cellpose Segmentation --- 
@@ -157,7 +146,7 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id,expected_n_c
             props = regionprops(masks) 
             
             if not props: 
-                results_dict[site_id] = (np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32), 0)
+                return_empty_result(site_id)
                 continue 
 
             # --- 2. Crop Cells (CPU) --- 
@@ -208,34 +197,38 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id,expected_n_c
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
                     gc.collect()
-                    
                     old_bs = current_batch_size
-                    # Reduce persistent batch size
                     current_batch_size = max(1, current_batch_size // 2)
-                    
-                    logging.warning(f"Consumer-{worker_id}: OOM at site {site_id}. PERMANENTLY dropping batch size: {old_bs} -> {current_batch_size}")
-                    
+                    logging.warning(f"Consumer-{worker_id}: OOM at site {site_id}. Dropping batch size: {old_bs} -> {current_batch_size}")
                     if old_bs == 1:
-                        logging.error(f"Consumer-{worker_id}: Site {site_id} failed with batch_size=1.")
                         site_features = []
                         break
             
             if len(site_features) > 0:
                 all_features_array = np.vstack(site_features) 
                 n_cells = len(all_cell_crops)
+                
+                # Reshape to (N_cells, N_channels, Feature_Length)
                 reshaped_features = all_features_array.reshape(n_cells, n_channels, FEATURE_LENGTH) 
-                mean_site_features = np.mean(reshaped_features, axis=0) 
-                results_dict[site_id] = (mean_site_features, n_cells)
+                
+                if single_cell_mode:
+                    # Return ALL cells without averaging
+                    results_dict[site_id] = (reshaped_features, n_cells)
+                else:
+                    # Aggregate
+                    mean_site_features = np.mean(reshaped_features, axis=0) 
+                    results_dict[site_id] = (mean_site_features, n_cells)
+                
                 logging.info(f"Consumer-{worker_id}: Finished SITE {site_id} ({n_cells} cells processed).")
             else:
-                results_dict[site_id] = (np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32), 0)
+                return_empty_result(site_id)
 
         except Empty: 
             continue 
         except Exception as e: 
             logging.error(f"Consumer-{worker_id} failed: {e}") 
-            if 'site_id' in locals() and 'n_channels' in locals(): 
-                results_dict[site_id] = (np.zeros((n_channels, FEATURE_LENGTH), dtype=np.float32), 0) 
+            if 'site_id' in locals(): 
+                return_empty_result(site_id)
 
     logging.info(f"Consumer-{worker_id} finished processing.")
 
@@ -262,9 +255,9 @@ def main(args):
         image_df=pd.read_csv(f"{args.csv_image_key}/Image.csv")
         not_failing_images = (image_df.filter(like='ImageQC_').sum(axis=1) < 2)
         load_data=load_data[not_failing_images].copy()
-
     else:
         logging.info("No csv_image_key provided — skipping image QC filtering.")
+
     tasks = [ 
         (index, [f"{args.data_base_path}/{row[c]}" for c in channel_columns]) 
         for index, row in load_data.iterrows() 
@@ -275,26 +268,22 @@ def main(args):
     # --- Initialize Multiprocessing Environment --- 
     with mp.Manager() as manager: 
         task_queue = Queue() 
-        # A buffer between CPU producers and GPU consumers. 
-        # Sized relative to consumers to prevent excessive RAM usage. 
         data_queue = Queue(maxsize=args.num_consumers) 
         results_dict = manager.dict() 
         stop_event = Event() 
 
-        # Populate the task queue for producers 
         for task in tasks: 
             task_queue.put(task) 
-
-        # Add sentinel values to signal producers to stop 
         for _ in range(args.max_workers): 
             task_queue.put(None) 
 
-        # --- Start Producer and Consumer Processes --- 
+        # --- Start Producers --- 
         producers = [ 
             Process(target=producer_worker, args=(task_queue, data_queue, i,args.channels,args.csv_image_key), name=f"Producer-{i}") 
             for i in range(args.max_workers) 
         ] 
-        # **MODIFIED: Create a list of consumers for GPUs >1** 
+
+        # --- Start Consumers ---
         expected_n_channels = len(args.channels)
         available_gpus = torch.cuda.device_count()
         if available_gpus == 0:
@@ -304,26 +293,20 @@ def main(args):
         consumers = [ 
             Process(
                 target=consumer_worker, 
-                args=(data_queue, results_dict, stop_event, i, expected_n_channels,i % available_gpus), 
+                args=(data_queue, results_dict, stop_event, i, expected_n_channels, i % available_gpus, args.single_cell), 
                 name=f"Consumer-{i}"
             ) 
             for i in range(args.num_consumers)
         ] 
 
         logging.info(f"Starting {args.max_workers} producers and {args.num_consumers} consumers...") 
-        # **MODIFIED: Start all consumers** 
-        for c in consumers: 
-            c.start() 
-        for p in producers: 
-            p.start() 
+        for c in consumers: c.start() 
+        for p in producers: p.start() 
         
-        # --- Monitor and Wait for Completion --- 
-        for p in producers: 
-            p.join() 
+        # --- Monitor --- 
+        for p in producers: p.join() 
+        logging.info("All producers have finished. Waiting for consumers...") 
         
-        logging.info("All producers have finished. Waiting for consumers to process remaining items.") 
-        
-        # Main progress monitoring loop 
         pbar = tqdm(total=num_tasks, desc="Overall Progress") 
         last_processed_count = 0 
         while len(results_dict) < num_tasks: 
@@ -331,102 +314,113 @@ def main(args):
             pbar.update(current_processed_count - last_processed_count) 
             last_processed_count = current_processed_count 
             time.sleep(2) 
-        
-        # Final update to ensure the progress bar reaches 100% 
         pbar.update(num_tasks - last_processed_count) 
         pbar.close() 
 
         logging.info("All tasks processed. Signaling consumers to shut down.")
         stop_event.set() 
-
-        # **MODIFIED: Signal all consumers to stop and wait for them** stop_event.set() 
-        for c in consumers: 
-            c.join() 
-
+        for c in consumers: c.join() 
         logging.info("All processes have completed.") 
 
         # --- Process and Save Results --- 
-        # Ensure results are sorted by site_id for correct merging 
-        # --- Process and Save Results --- 
         original_indices = [task[0] for task in tasks]
         
-        # Retrieve the tuple (feature_array, cell_count)
+        # Retrieve results
         raw_results = [results_dict[i] for i in original_indices]
         
-        # Unpack into two separate lists
-        site_features = [item[0] for item in raw_results]
+        # Unpack
+        site_features = [item[0] for item in raw_results] # In single_cell mode, these are (N_cells, C, F) arrays
         site_counts = [item[1] for item in raw_results]
         
         logging.info("Site-level processing complete. Preparing outputs.") 
 
-        # --- OUTPUT 1: Cell Counts CSV ---
-        # Add the counts to the original load_data dataframe which has the Metadata
+        # --- OUTPUT 1: Cell Counts CSV (Always generated) ---
         load_data['Cell_Count'] = site_counts
-        
-        # Define output path for counts (e.g., replace .parquet with _counts.csv)
         counts_out_path = args.out_data_path.replace('.parquet', '_counts.csv')
-        
         logging.info(f"Saving site-level cell counts to {counts_out_path}")
-        # Save complete metadata + counts
         load_data.to_csv(counts_out_path, index=False)
 
-        # --- OUTPUT 2: Feature Aggregation (Parquet) ---
-        results_df = pd.DataFrame({'mean_features': site_features}, index=original_indices)
-        # We join again to ensure the 'mean_features' column is attached to the dataframe used for aggregation
-        # Note: 'load_data' now has 'Cell_Count', which is fine.
-        load_data = load_data.join(results_df)
-
-        logging.info("Aggregating features to well level...") 
-        metadata_cols = ["Metadata_Well", "Metadata_Timepoint", "Metadata_Plate"] 
+        # --- OUTPUT 2: Features (Branch Logic) ---
         
-        # We only aggregate features here, but you could also aggregate Cell_Count (sum) if you wanted
-        df_subset = load_data[metadata_cols + ['mean_features']] 
-        # --- Debugging Helper Function ---
-        def safe_stack_and_mean(series):
-            # 1. Get all shapes in this group (Well)
-            shapes = [arr.shape for arr in series]
-            unique_shapes = set(shapes)
+        if args.single_cell:
+            logging.info("SINGLE CELL MODE DETECTED: Skipping Aggregation.")
+            logging.info("Expanding site-level metadata to cell-level...")
+
+            # 1. Attach features and counts to the dataframe (site level)
+            # Use a temporary column to hold the arrays
+            load_data['features_temp'] = site_features
             
-            # 2. If everything matches, proceed normally
-            if len(unique_shapes) == 1:
-                return np.mean(np.stack(series.values), axis=0)
+            # 2. Filter out sites with 0 cells to avoid errors during expansion
+            valid_sites = load_data[load_data['Cell_Count'] > 0].copy()
             
-            # 3. IF SHAPES DON'T MATCH: PRINT DEBUG INFO AND CRASH
-            else:
-                # Find the majority shape (the "correct" one)
-                from collections import Counter
-                most_common_shape = Counter(shapes).most_common(1)[0][0]
-                
-                logging.error(f"!!! SHAPE MISMATCH IN WELL !!! Found shapes: {unique_shapes}")
-                
-                # Identify the culprit sites
-                for site_id, arr in series.items():
-                    if arr.shape != most_common_shape:
-                        logging.error(f"Culprit Site: {site_id} | Shape: {arr.shape} (Expected {most_common_shape})")
-                
-                # Return a placeholder of the CORRECT shape to prevent crash, 
-                # allowing other wells to finish.
-                correct_shape_zeros = np.zeros(most_common_shape, dtype=np.float32)
-                return correct_shape_zeros
+            if valid_sites.empty:
+                logging.warning("No cells detected in the entire dataset. Saving empty parquet.")
+                valid_sites.to_parquet(args.out_data_path, engine='pyarrow')
+                return
 
-        agg_functions = { 
-            'mean_features': safe_stack_and_mean 
-        } 
-        for col in metadata_cols: 
-            if col != 'Metadata_Well': 
-                agg_functions[col] = 'first' 
+            # 3. Expand Metadata: Repeat site rows N times (where N = Cell_Count)
+            # 'index.repeat' creates a new index with repeated labels
+            expanded_df = valid_sites.loc[valid_sites.index.repeat(valid_sites['Cell_Count'])].copy()
+            
+            # 4. Flatten the features
+            # 'features_temp' contains list of (N_cells, C, F) arrays.
+            # We stack them into one massive (Total_Cells, C, F) array
+            all_features_stacked = np.vstack(valid_sites['features_temp'].values)
+            
+            # 5. Assign to the expanded dataframe
+            # Since parquet columns handle lists better than raw 3D numpy arrays, 
+            # we convert the (C, F) array for each cell into a list (or flat list depending on preference).
+            # Here we keep structure: list of lists
+            logging.info(f"Formatting {len(expanded_df)} cells for Parquet export...")
+            
+            # We must assign the features row-by-row. 
+            # Since all_features_stacked is aligned with expanded_df, we can listify it.
+            # Note: This step can be memory intensive.
+            expanded_df['single_cell_features'] = list(all_features_stacked)
+            
+            # Clean up temporary columns
+            expanded_df['single_cell_features'] = expanded_df['single_cell_features'].apply(lambda x: x.tolist())
+            expanded_df = expanded_df.drop(columns=['features_temp'])
+            
+            logging.info(f"Saving SINGLE CELL results to {args.out_data_path}")
+            expanded_df.to_parquet(args.out_data_path, engine='pyarrow')
 
-        well_level_data = df_subset.groupby('Metadata_Well').agg(agg_functions).reset_index() 
-        well_level_data['mean_features'] = well_level_data['mean_features'].apply(lambda x: x.tolist()) 
+        else:
+            # --- Standard Aggregation Mode ---
+            logging.info("Standard Mode: Aggregating features to well level...")
+            
+            results_df = pd.DataFrame({'mean_features': site_features}, index=original_indices)
+            load_data = load_data.join(results_df)
 
-        logging.info(f"Saving feature results to {args.out_data_path}") 
-        well_level_data.to_parquet(args.out_data_path, engine='pyarrow') 
-        # Explicitly close queues to release semaphores and silence warnings
-        task_queue.close()
-        task_queue.join_thread()
-        
-        data_queue.close()
-        data_queue.join_thread()
+            metadata_cols = ["Metadata_Well", "Metadata_Timepoint", "Metadata_Plate"] 
+            
+            def safe_stack_and_mean(series):
+                shapes = [arr.shape for arr in series]
+                unique_shapes = set(shapes)
+                if len(unique_shapes) == 1:
+                    return np.mean(np.stack(series.values), axis=0)
+                else:
+                    from collections import Counter
+                    most_common_shape = Counter(shapes).most_common(1)[0][0]
+                    correct_shape_zeros = np.zeros(most_common_shape, dtype=np.float32)
+                    return correct_shape_zeros
+
+            agg_functions = { 'mean_features': safe_stack_and_mean } 
+            for col in metadata_cols: 
+                if col != 'Metadata_Well': agg_functions[col] = 'first' 
+
+            well_level_data = df_subset.groupby('Metadata_Well').agg(agg_functions).reset_index() if 'df_subset' not in locals() else load_data[metadata_cols + ['mean_features']].groupby('Metadata_Well').agg(agg_functions).reset_index()
+            # Note: df_subset variable definition was inside logic block in original, fixed here:
+            well_level_data = load_data[metadata_cols + ['mean_features']].groupby('Metadata_Well').agg(agg_functions).reset_index()
+            
+            well_level_data['mean_features'] = well_level_data['mean_features'].apply(lambda x: x.tolist()) 
+
+            logging.info(f"Saving AGGREGATED results to {args.out_data_path}") 
+            well_level_data.to_parquet(args.out_data_path, engine='pyarrow') 
+
+        # Cleanup
+        task_queue.close(); task_queue.join_thread()
+        data_queue.close(); data_queue.join_thread()
         logging.info("Script finished successfully.") 
 
 
@@ -440,6 +434,9 @@ if __name__ == '__main__':
     parser.add_argument('--csv-image-key', type=str, required=False, help='S3 key to the Image.csv file.')
     parser.add_argument('--channels', nargs='+', type=str, required=True, help='Channel list and order (first 3 are used for segmentation).')
     parser.add_argument('--out-data-path', type=str, required=True, help='Local or S3 path for the final output Parquet file.') 
+    
+    # --- ADDED FLAG ---
+    parser.add_argument('--single_cell', action='store_true', help='If set, skips well-level aggregation and saves features for every single cell.')
 
     args = parser.parse_args() 
 
