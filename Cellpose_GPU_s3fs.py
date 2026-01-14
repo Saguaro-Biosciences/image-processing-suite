@@ -253,7 +253,7 @@ def main(args):
     channel_columns = [f'FileName_{c}' for c in args.channels]
     if getattr(args, "csv_image_key", None):
         image_df=pd.read_csv(f"{args.csv_image_key}/Image.csv")
-        not_failing_images = (image_df.filter(like='ImageQC_').sum(axis=1) < 2)
+        not_failing_images = (image_df.filter(like='ImageQC_').sum(axis=1) < 1)
         load_data=load_data[not_failing_images].copy()
     else:
         logging.info("No csv_image_key provided — skipping image QC filtering.")
