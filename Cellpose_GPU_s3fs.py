@@ -409,8 +409,6 @@ def main(args):
             for col in metadata_cols: 
                 if col != 'Metadata_Well': agg_functions[col] = 'first' 
 
-            well_level_data = df_subset.groupby('Metadata_Well').agg(agg_functions).reset_index() if 'df_subset' not in locals() else load_data[metadata_cols + ['mean_features']].groupby('Metadata_Well').agg(agg_functions).reset_index()
-            # Note: df_subset variable definition was inside logic block in original, fixed here:
             well_level_data = load_data[metadata_cols + ['mean_features']].groupby('Metadata_Well').agg(agg_functions).reset_index()
             
             well_level_data['mean_features'] = well_level_data['mean_features'].apply(lambda x: x.tolist()) 
