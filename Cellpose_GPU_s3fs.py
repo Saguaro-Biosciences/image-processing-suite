@@ -151,24 +151,32 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_
 
             # --- 2. Crop Cells (CPU) --- 
             all_cell_crops = [] 
+            cell_coords = []
             h, w, _ = image_4ch.shape 
             for prop in props: 
                 y_center, x_center = map(int, prop.centroid) 
+                
+                # Purge cells touching absolute image limits
+                if (y_center - half_box < 0) or (y_center + half_box > h) or \
+                   (x_center - half_box < 0) or (x_center + half_box > w):
+                    continue
+                
                 target_id = prop.label 
-                y1, y2 = max(0, y_center - half_box), min(h, y_center + half_box) 
-                x1, x2 = max(0, x_center - half_box), min(w, x_center + half_box) 
+                y1, y2 = y_center - half_box, y_center + half_box 
+                x1, x2 = x_center - half_box, x_center + half_box 
                 
                 mask_crop = masks[y1:y2, x1:x2] 
                 binary_mask = (mask_crop == target_id)[:, :, np.newaxis] 
-                
                 cell_crop_4ch = image_4ch[y1:y2, x1:x2, :] 
                 masked_cell_crop = cell_crop_4ch * binary_mask 
                 
-                pad_h = BOX_SIZE - masked_cell_crop.shape[0] 
-                pad_w = BOX_SIZE - masked_cell_crop.shape[1] 
-                padded_crop = np.pad(masked_cell_crop, ((0, pad_h), (0, pad_w), (0, 0)), 'constant') 
-                all_cell_crops.append(padded_crop) 
+                all_cell_crops.append(masked_cell_crop)
+                cell_coords.append((y_center, x_center)) 
 
+            if not all_cell_crops:
+                return_empty_result(site_id)
+                continue
+            
             # --- 3. Run Batched Feature Extraction --- 
             batch_pil_images = [] 
             for cell_crop in all_cell_crops: 
@@ -212,12 +220,12 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_
                 reshaped_features = all_features_array.reshape(n_cells, n_channels, FEATURE_LENGTH) 
                 
                 if single_cell_mode:
-                    # Return ALL cells without averaging
-                    results_dict[site_id] = (reshaped_features, n_cells)
+                    #Return cell level embeddings
+                    results_dict[site_id] = (reshaped_features, n_cells, cell_coords)
                 else:
-                    # Aggregate
-                    mean_site_features = np.mean(reshaped_features, axis=0) 
-                    results_dict[site_id] = (mean_site_features, n_cells)
+                    #Pass SUM instead of MEAN to allow true well-level weighting
+                    sum_site_features = np.sum(reshaped_features, axis=0) 
+                    results_dict[site_id] = (sum_site_features, n_cells, cell_coords)
                 
                 logging.info(f"Consumer-{worker_id}: Finished SITE {site_id} ({n_cells} cells processed).")
             else:
@@ -263,7 +271,7 @@ def main(args):
         for index, row in load_data.iterrows() 
     ] 
     num_tasks = len(tasks) 
-    logging.info(f"Prepared {num_tasks} sites for processing.") 
+    logging.info(f"Prepared {num_tasks} sites for processing. Out of ") # Add the original dim[1] of the load data set 
 
     # --- Initialize Multiprocessing Environment --- 
     with mp.Manager() as manager: 
@@ -322,23 +330,37 @@ def main(args):
         for c in consumers: c.join() 
         logging.info("All processes have completed.") 
 
-        # --- Process and Save Results --- 
+        # --- Process Results --- 
         original_indices = [task[0] for task in tasks]
-        
-        # Retrieve results
         raw_results = [results_dict[i] for i in original_indices]
         
-        # Unpack
-        site_features = [item[0] for item in raw_results] # In single_cell mode, these are (N_cells, C, F) arrays
+        site_features = [item[0] for item in raw_results]
         site_counts = [item[1] for item in raw_results]
+        site_coords = [item[2] for item in raw_results]
         
-        logging.info("Site-level processing complete. Preparing outputs.") 
-
-        # --- OUTPUT 1: Cell Counts CSV (Always generated) ---
         load_data['Cell_Count'] = site_counts
         counts_out_path = args.out_data_path.replace('.parquet', '_counts.csv')
         logging.info(f"Saving site-level cell counts to {counts_out_path}")
         load_data.to_csv(counts_out_path, index=False)
+
+        # --- Opt OUTPUT Save Coordinates Output ---
+        if args.save_coords:
+            logging.info("Building Cell Coordinates Table...")
+            coords_records = []
+            for idx, coords_list in zip(original_indices, site_coords):
+                well = load_data.loc[idx, 'Metadata_Well']
+                site = load_data.loc[idx, 'Metadata_Site'] if 'Metadata_Site' in load_data.columns else str(idx)
+                for cell_idx, (y, x) in enumerate(coords_list):
+                    coords_records.append({
+                        'Cell_ID': f"{well}_{site}_cell{cell_idx}",
+                        'Y_Center': y,
+                        'X_Center': x
+                    })
+            if coords_records:
+                coords_df = pd.DataFrame(coords_records)
+                coords_out_path = args.out_data_path.replace('.parquet', '_coords.parquet')
+                coords_df.to_parquet(coords_out_path, engine='pyarrow')
+                logging.info(f"Saved coordinates to {coords_out_path}")
 
         # --- OUTPUT 2: Features (Branch Logic) ---
         
@@ -388,33 +410,29 @@ def main(args):
         else:
             # --- Standard Aggregation Mode ---
             logging.info("Standard Mode: Aggregating features to well level...")
-            
-            results_df = pd.DataFrame({'mean_features': site_features}, index=original_indices)
-            load_data = load_data.join(results_df)
-
+            load_data['sum_features'] = site_features
             metadata_cols = ["Metadata_Well", "Metadata_Timepoint", "Metadata_Plate"] 
             
-            def safe_stack_and_mean(series):
-                shapes = [arr.shape for arr in series]
-                unique_shapes = set(shapes)
-                if len(unique_shapes) == 1:
-                    return np.mean(np.stack(series.values), axis=0)
-                else:
-                    from collections import Counter
-                    most_common_shape = Counter(shapes).most_common(1)[0][0]
-                    correct_shape_zeros = np.zeros(most_common_shape, dtype=np.float32)
-                    return correct_shape_zeros
+            def sum_arrays(series):
+                return np.sum(np.stack(series.values), axis=0)
 
-            agg_functions = { 'mean_features': safe_stack_and_mean } 
+            agg_funcs = {'sum_features': sum_arrays, 'Cell_Count': 'sum'}
             for col in metadata_cols: 
-                if col != 'Metadata_Well': agg_functions[col] = 'first' 
+                if col != 'Metadata_Well' and col in load_data.columns: 
+                    agg_funcs[col] = 'first' 
 
-            well_level_data = load_data[metadata_cols + ['mean_features']].groupby('Metadata_Well').agg(agg_functions).reset_index()
+            well_level_data = load_data.groupby('Metadata_Well').agg(agg_funcs).reset_index()
             
-            well_level_data['mean_features'] = well_level_data['mean_features'].apply(lambda x: x.tolist()) 
+            # Calculate final weighted mean
+            well_level_data['mean_features'] = well_level_data.apply(
+                lambda row: (row['sum_features'] / row['Cell_Count']).tolist() if row['Cell_Count'] > 0 else np.zeros((expected_n_channels, FEATURE_LENGTH)).tolist(), 
+                axis=1
+            )
+            well_level_data = well_level_data.drop(columns=['sum_features'])
+
+            well_level_data.to_parquet(args.out_data_path, engine='pyarrow') 
 
             logging.info(f"Saving AGGREGATED results to {args.out_data_path}") 
-            well_level_data.to_parquet(args.out_data_path, engine='pyarrow') 
 
         # Cleanup
         task_queue.close(); task_queue.join_thread()
@@ -435,7 +453,8 @@ if __name__ == '__main__':
     
     # --- ADDED FLAG ---
     parser.add_argument('--single_cell', action='store_true', help='If set, skips well-level aggregation and saves features for every single cell.')
-
+    parser.add_argument('--save-coords', action='store_true', help='Saves a coordinate table for all valid cells.')
+    
     args = parser.parse_args() 
 
     try: 
