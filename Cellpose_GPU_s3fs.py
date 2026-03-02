@@ -81,9 +81,10 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
                 logging.error(f"Producer-{worker_id} failed on site {site_id}: {e}") 
                 data_queue.put((site_id, None))
 
-def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels, gpu_id=0, single_cell_mode=False): 
+def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels, gpu_id=0, single_cell_mode=False, xgb_model_path=None, filter_dead_cells=False): 
     import os
     import gc 
+    import xgboost as xgb
     
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     internal_device_id = 0
@@ -92,154 +93,140 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_
     from cellpose import models 
     from transformers import AutoImageProcessor, AutoModel
     
-    logging.info(f"Consumer-{worker_id} started. Physical GPU: {gpu_id} -> Mapped to cuda:{internal_device_id} | Single Cell Mode: {single_cell_mode}") 
-    
+    logging.info(f"Consumer-{worker_id} started. GPU: {gpu_id} | Single Cell: {single_cell_mode} | XGB: {bool(xgb_model_path)}") 
     device = torch.device(f"cuda:{internal_device_id}" if torch.cuda.is_available() else "cpu") 
     
-    # --- Load Models --- 
-    logging.info(f"Consumer-{worker_id}: Loading Cellpose model...") 
+    # --- Load Deep Learning Models --- 
     cell_model = models.CellposeModel(gpu=(device.type == 'cuda'), model_type=CELLPOSE_MODEL, device=device) 
-    
-    logging.info(f"Consumer-{worker_id}: Loading feature extraction model...") 
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME) 
     feature_model = AutoModel.from_pretrained(MODEL_NAME).to(device).eval() 
     
+    # --- Load XGBoost Model ---
+    bst = None
+    if xgb_model_path:
+        logging.info(f"Consumer-{worker_id}: Loading XGBoost model...")
+        bst = xgb.Booster()
+        bst.load_model(xgb_model_path)
+
     half_box = BOX_SIZE // 2 
     current_batch_size = INFERENCE_BATCH_SIZE 
 
-    # Helper for empty return
     def return_empty_result(s_id):
         if single_cell_mode:
-            # Return empty array with shape (0, n_ch, feat)
-            results_dict[s_id] = (np.zeros((0, expected_n_channels, FEATURE_LENGTH), dtype=np.float32), 0)
+            results_dict[s_id] = (np.zeros((0, expected_n_channels, FEATURE_LENGTH), dtype=np.float32), 0, [], np.array([], dtype=bool))
         else:
-            # Return zero vector for site aggregation
-            results_dict[s_id] = (np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32), 0)
+            results_dict[s_id] = (np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32), 0, [], np.array([], dtype=bool))
 
     while not stop_event.is_set(): 
         try: 
             item = data_queue.get(timeout=1) 
             site_id, image_4ch = item 
             
-            # --- Shape Consistency ---
-            if image_4ch is None: 
-                logging.warning(f"Consumer-{worker_id}: [ERROR] Site {site_id} is None. Returning placeholder.")
+            if image_4ch is None or image_4ch.shape[-1] != expected_n_channels: 
                 return_empty_result(site_id)
                 continue 
-
-            if image_4ch.shape[-1] != expected_n_channels:
-                logging.error(f"Consumer-{worker_id}: [ERROR] Site {site_id} has wrong shape {image_4ch.shape}. Skipping.")
-                return_empty_result(site_id)
-                continue
             
             n_channels = expected_n_channels
             
-            # --- 1. Run Cellpose Segmentation --- 
+            # --- 1. Run Cellpose --- 
             try:
                 masks, _, _ = cell_model.eval(image_4ch, diameter=100) 
             except torch.cuda.OutOfMemoryError:
-                logging.warning(f"Consumer-{worker_id}: OOM during Cellpose (Site {site_id}). Clearing cache.")
                 torch.cuda.empty_cache()
                 gc.collect()
                 masks, _, _ = cell_model.eval(image_4ch, diameter=100) 
 
             props = regionprops(masks) 
-            
             if not props: 
                 return_empty_result(site_id)
                 continue 
 
-            # --- 2. Crop Cells (CPU) --- 
+            # --- 2. Crop Cells --- 
             all_cell_crops = [] 
             cell_coords = []
             h, w, _ = image_4ch.shape 
             for prop in props: 
                 y_center, x_center = map(int, prop.centroid) 
-                
-                # Purge cells touching absolute image limits
-                if (y_center - half_box < 0) or (y_center + half_box > h) or \
-                   (x_center - half_box < 0) or (x_center + half_box > w):
+                if (y_center - half_box < 0) or (y_center + half_box > h) or (x_center - half_box < 0) or (x_center + half_box > w):
                     continue
                 
                 target_id = prop.label 
-                y1, y2 = y_center - half_box, y_center + half_box 
-                x1, x2 = x_center - half_box, x_center + half_box 
-                
+                y1, y2, x1, x2 = y_center - half_box, y_center + half_box, x_center - half_box, x_center + half_box 
                 mask_crop = masks[y1:y2, x1:x2] 
                 binary_mask = (mask_crop == target_id)[:, :, np.newaxis] 
-                cell_crop_4ch = image_4ch[y1:y2, x1:x2, :] 
-                masked_cell_crop = cell_crop_4ch * binary_mask 
-                
-                all_cell_crops.append(masked_cell_crop)
+                all_cell_crops.append(image_4ch[y1:y2, x1:x2, :] * binary_mask)
                 cell_coords.append((y_center, x_center)) 
 
             if not all_cell_crops:
                 return_empty_result(site_id)
                 continue
             
-            # --- 3. Run Batched Feature Extraction --- 
+            # --- 3. Extract Features --- 
             batch_pil_images = [] 
             for cell_crop in all_cell_crops: 
                 for ch in range(n_channels): 
                     scaled_8bit = scale_to_8bit(cell_crop[:, :, ch]) 
-                    pil_image = Image.fromarray(scaled_8bit).convert("RGB") 
-                    batch_pil_images.append(pil_image) 
+                    batch_pil_images.append(Image.fromarray(scaled_8bit).convert("RGB")) 
 
-            site_features = [] 
-            idx = 0
+            site_features, idx = [], 0
             total_images = len(batch_pil_images)
 
             while idx < total_images:
                 end_idx = min(idx + current_batch_size, total_images)
                 mini_batch = batch_pil_images[idx : end_idx]
-                
                 try:
                     inputs = processor(images=mini_batch, return_tensors="pt").to(device) 
                     with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.float16): 
                         outputs = feature_model(**inputs) 
-                    
-                    features = outputs.pooler_output.cpu().to(torch.float32).numpy() 
-                    site_features.append(features)
+                    site_features.append(outputs.pooler_output.cpu().to(torch.float32).numpy())
                     idx = end_idx 
-
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
                     gc.collect()
-                    old_bs = current_batch_size
                     current_batch_size = max(1, current_batch_size // 2)
-                    logging.warning(f"Consumer-{worker_id}: OOM at site {site_id}. Dropping batch size: {old_bs} -> {current_batch_size}")
-                    if old_bs == 1:
+                    if current_batch_size == 1:
                         site_features = []
                         break
             
             if len(site_features) > 0:
-                all_features_array = np.vstack(site_features) 
                 n_cells = len(all_cell_crops)
+                reshaped_features = np.vstack(site_features).reshape(n_cells, n_channels, FEATURE_LENGTH) 
                 
-                # Reshape to (N_cells, N_channels, Feature_Length)
-                reshaped_features = all_features_array.reshape(n_cells, n_channels, FEATURE_LENGTH) 
+                # --- 4. XGBoost Inference & Filtering Logic ---
+                is_dead = np.zeros(n_cells, dtype=bool)
+                if bst is not None:
+                    # Flatten features to 2D for XGBoost: [N_cells, Channels * Features]
+                    flat_features = reshaped_features.reshape(n_cells, -1) 
+                    dtrain = xgb.DMatrix(flat_features)
+                    preds = bst.predict(dtrain)
+                    is_dead = (preds > 0.5) # Boolean array of dead cells
                 
                 if single_cell_mode:
-                    #Return cell level embeddings
-                    results_dict[site_id] = (reshaped_features, n_cells, cell_coords)
+                    # Return all features, count, coords, and the flags
+                    results_dict[site_id] = (reshaped_features, n_cells, cell_coords, is_dead)
                 else:
-                    #Pass SUM instead of MEAN to allow true well-level weighting
-                    sum_site_features = np.sum(reshaped_features, axis=0) 
-                    results_dict[site_id] = (sum_site_features, n_cells, cell_coords)
+                    if bst is not None and filter_dead_cells:
+                        alive_mask = ~is_dead
+                        alive_count = np.sum(alive_mask)
+                        if alive_count > 0:
+                            sum_feats = np.sum(reshaped_features[alive_mask], axis=0)
+                        else:
+                            sum_feats = np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32)
+                        
+                        # Return summed LIVE features, LIVE count
+                        results_dict[site_id] = (sum_feats, alive_count, cell_coords, is_dead)
+                    else:
+                        # Standard aggregate mode without filtering
+                        results_dict[site_id] = (np.sum(reshaped_features, axis=0), n_cells, cell_coords, is_dead)
                 
-                logging.info(f"Consumer-{worker_id}: Finished SITE {site_id} ({n_cells} cells processed).")
+                logging.info(f"Consumer-{worker_id}: Finished SITE {site_id} ({n_cells} total cells, {np.sum(is_dead)} dead).")
             else:
                 return_empty_result(site_id)
 
-        except Empty: 
-            continue 
+        except Empty: continue 
         except Exception as e: 
             logging.error(f"Consumer-{worker_id} failed: {e}") 
-            if 'site_id' in locals(): 
-                return_empty_result(site_id)
-
-    logging.info(f"Consumer-{worker_id} finished processing.")
-
+            if 'site_id' in locals(): return_empty_result(site_id)
 
 # --- 3. Main Execution Block --- 
 def main(args): 
@@ -298,14 +285,10 @@ def main(args):
             logging.warning("No GPUs detected. Defaulting to GPU logic on CPU (index 0).")
             available_gpus = 1
 
-        consumers = [ 
-            Process(
-                target=consumer_worker, 
-                args=(data_queue, results_dict, stop_event, i, expected_n_channels, i % available_gpus, args.single_cell), 
-                name=f"Consumer-{i}"
-            ) 
-            for i in range(args.num_consumers)
-        ] 
+        consumers = [Process(
+            target=consumer_worker, 
+            args=(data_queue, results_dict, stop_event, i, expected_n_channels, i % available_gpus, args.single_cell, args.xgb_model_path, args.filter_dead_cells)
+        ) for i in range(args.num_consumers)]
 
         logging.info(f"Starting {args.max_workers} producers and {args.num_consumers} consumers...") 
         for c in consumers: c.start() 
@@ -318,12 +301,8 @@ def main(args):
         pbar = tqdm(total=num_tasks, desc="Overall Progress") 
         last_processed_count = 0 
         while len(results_dict) < num_tasks: 
-            current_processed_count = len(results_dict) 
-            pbar.update(current_processed_count - last_processed_count) 
-            last_processed_count = current_processed_count 
-            time.sleep(2) 
-        pbar.update(num_tasks - last_processed_count) 
-        pbar.close() 
+            pbar.update(len(results_dict) - last_count); last_count = len(results_dict); time.sleep(2) 
+        pbar.update(num_tasks - last_count); pbar.close() 
 
         logging.info("All tasks processed. Signaling consumers to shut down.")
         stop_event.set() 
@@ -337,6 +316,7 @@ def main(args):
         site_features = [item[0] for item in raw_results]
         site_counts = [item[1] for item in raw_results]
         site_coords = [item[2] for item in raw_results]
+        site_dead_flags = [item[3] for item in raw_results]
         
         load_data['Cell_Count'] = site_counts
         counts_out_path = args.out_data_path.replace('.parquet', '_counts.csv')
@@ -345,92 +325,59 @@ def main(args):
 
         # --- Opt OUTPUT Save Coordinates Output ---
         if args.save_coords:
-            logging.info("Building Cell Coordinates Table...")
             coords_records = []
-            for idx, coords_list in zip(original_indices, site_coords):
+            for idx, coords_list, dead_flags in zip(original_indices, site_coords, site_dead_flags):
                 well = load_data.loc[idx, 'Metadata_Well']
                 site = load_data.loc[idx, 'Metadata_Site'] if 'Metadata_Site' in load_data.columns else str(idx)
                 for cell_idx, (y, x) in enumerate(coords_list):
-                    coords_records.append({
-                        'Cell_ID': f"{well}_{site}_cell{cell_idx}",
-                        'Y_Center': y,
-                        'X_Center': x
-                    })
+                    is_dead = dead_flags[cell_idx] if len(dead_flags) > 0 else False
+                    coords_records.append({'Cell_ID': f"{well}_{site}_{cell_idx}", 'Y_Center': y, 'X_Center': x, 'Is_Dead': is_dead})
             if coords_records:
-                coords_df = pd.DataFrame(coords_records)
-                coords_out_path = args.out_data_path.replace('.parquet', '_coords.parquet')
-                coords_df.to_parquet(coords_out_path, engine='pyarrow')
-                logging.info(f"Saved coordinates to {coords_out_path}")
+                pd.DataFrame(coords_records).to_parquet(args.out_data_path.replace('.parquet', '_coords.parquet'), engine='pyarrow')
 
         # --- OUTPUT 2: Features (Branch Logic) ---
         
         if args.single_cell:
-            logging.info("SINGLE CELL MODE DETECTED: Skipping Aggregation.")
-            logging.info("Expanding site-level metadata to cell-level...")
-
-            # 1. Attach features and counts to the dataframe (site level)
-            # Use a temporary column to hold the arrays
+            logging.info("SINGLE CELL MODE DETECTED: Formatting output...")
             load_data['features_temp'] = site_features
+            load_data['dead_flags_temp'] = site_dead_flags
             
-            # 2. Filter out sites with 0 cells to avoid errors during expansion
-            valid_sites = load_data[load_data['Cell_Count'] > 0].copy()
-            
+            valid_sites = load_data[load_data['Cell_Count'] > 0].copy() 
             if valid_sites.empty:
-                logging.warning("No cells detected in the entire dataset. Saving empty parquet.")
-                valid_sites.to_parquet(args.out_data_path, engine='pyarrow')
-                return
+                valid_sites.to_parquet(args.out_data_path, engine='pyarrow'); return
 
-            # 3. Expand Metadata: Repeat site rows N times (where N = Cell_Count)
-            # 'index.repeat' creates a new index with repeated labels
-            expanded_df = valid_sites.loc[valid_sites.index.repeat(valid_sites['Cell_Count'])].copy()
+            # Expand the dataframe
+            expanded_df = valid_sites.loc[valid_sites.index.repeat([len(f) for f in valid_sites['features_temp']])].copy()
+            # Group by the original index and count sequentially (0, 1, 2, ...)
+            expanded_df['Cell_Index'] = expanded_df.groupby(level=0).cumcount()
             
-            # 4. Flatten the features
-            # 'features_temp' contains list of (N_cells, C, F) arrays.
-            # We stack them into one massive (Total_Cells, C, F) array
-            all_features_stacked = np.vstack(valid_sites['features_temp'].values)
-            
-            # 5. Assign to the expanded dataframe
-            # Since parquet columns handle lists better than raw 3D numpy arrays, 
-            # we convert the (C, F) array for each cell into a list (or flat list depending on preference).
-            # Here we keep structure: list of lists
-            logging.info(f"Formatting {len(expanded_df)} cells for Parquet export...")
-            
-            # We must assign the features row-by-row. 
-            # Since all_features_stacked is aligned with expanded_df, we can listify it.
-            # Note: This step can be memory intensive.
-            expanded_df['single_cell_features'] = list(all_features_stacked)
-            
-            # Clean up temporary columns
+            # Unpack the features
+            expanded_df['single_cell_features'] = list(np.vstack(valid_sites['features_temp'].values))
             expanded_df['single_cell_features'] = expanded_df['single_cell_features'].apply(lambda x: x.tolist())
-            expanded_df = expanded_df.drop(columns=['features_temp'])
             
-            logging.info(f"Saving SINGLE CELL results to {args.out_data_path}")
+            if args.xgb_model_path:
+                expanded_df['is_dead_cell'] = np.concatenate(valid_sites['dead_flags_temp'].values)
+                
+            # Drop the temporary columns AND the old Cell_Count
+            expanded_df = expanded_df.drop(columns=['features_temp', 'dead_flags_temp', 'Cell_Count'])
+            
             expanded_df.to_parquet(args.out_data_path, engine='pyarrow')
 
         else:
-            # --- Standard Aggregation Mode ---
             logging.info("Standard Mode: Aggregating features to well level...")
             load_data['sum_features'] = site_features
             metadata_cols = ["Metadata_Well", "Metadata_Timepoint", "Metadata_Plate"] 
             
-            def sum_arrays(series):
-                return np.sum(np.stack(series.values), axis=0)
-
-            agg_funcs = {'sum_features': sum_arrays, 'Cell_Count': 'sum'}
+            agg_funcs = {'sum_features': lambda s: np.sum(np.stack(s.values), axis=0), 'Cell_Count': 'sum'}
             for col in metadata_cols: 
-                if col != 'Metadata_Well' and col in load_data.columns: 
-                    agg_funcs[col] = 'first' 
+                if col != 'Metadata_Well' and col in load_data.columns: agg_funcs[col] = 'first' 
 
             well_level_data = load_data.groupby('Metadata_Well').agg(agg_funcs).reset_index()
-            
-            # Calculate final weighted mean
             well_level_data['mean_features'] = well_level_data.apply(
                 lambda row: (row['sum_features'] / row['Cell_Count']).tolist() if row['Cell_Count'] > 0 else np.zeros((expected_n_channels, FEATURE_LENGTH)).tolist(), 
                 axis=1
             )
-            well_level_data = well_level_data.drop(columns=['sum_features'])
-
-            well_level_data.to_parquet(args.out_data_path, engine='pyarrow') 
+            well_level_data.drop(columns=['sum_features']).to_parquet(args.out_data_path, engine='pyarrow')
 
             logging.info(f"Saving AGGREGATED results to {args.out_data_path}") 
 
@@ -441,26 +388,21 @@ def main(args):
 
 
 if __name__ == '__main__': 
-    parser = argparse.ArgumentParser(description="Run the optimized cell image analysis pipeline.")
-    parser.add_argument('--data-base-path', type=str, required=True, help='Base path to the mounted data directory.') 
-    parser.add_argument('--num-consumers', type=int, default=2, help='Number of parallel GPU consumer processes.') 
-    parser.add_argument('--max-workers', type=int, default=24, help='Number of parallel CPU I/O producer processes.') 
-    parser.add_argument('--bucket-input', type=str, required=True, help='Name of the S3 bucket for input data.') 
-    parser.add_argument('--load-data-key', type=str, required=True, help='S3 key to the load_data.csv file.')
-    parser.add_argument('--csv-image-key', type=str, required=False, help='S3 key to the Image.csv file.')
-    parser.add_argument('--channels', nargs='+', type=str, required=True, help='Channel list and order (first 3 are used for segmentation).')
-    parser.add_argument('--out-data-path', type=str, required=True, help='Local or S3 path for the final output Parquet file.') 
-    
-    # --- ADDED FLAG ---
-    parser.add_argument('--single_cell', action='store_true', help='If set, skips well-level aggregation and saves features for every single cell.')
-    parser.add_argument('--save-coords', action='store_true', help='Saves a coordinate table for all valid cells.')
+    parser = argparse.ArgumentParser(description="Run cell image analysis pipeline. Takes into account image level QC, XGboost model assesment for dead cells. Singel cell and well level embedding extraction using Efficientnet.")
+    parser.add_argument('--data-base-path', type=str, required=True) 
+    parser.add_argument('--num-consumers', type=int, default=2) 
+    parser.add_argument('--max-workers', type=int, default=24) 
+    parser.add_argument('--bucket-input', type=str, required=True) 
+    parser.add_argument('--load-data-key', type=str, required=True)
+    parser.add_argument('--csv-image-key', type=str, required=False)
+    parser.add_argument('--channels', nargs='+', type=str, required=True)
+    parser.add_argument('--out-data-path', type=str, required=True) 
+    parser.add_argument('--single_cell', action='store_true')
+    parser.add_argument('--save-coords', action='store_true')
+    parser.add_argument('--xgb-model-path', type=str, default=None, help='Path to XGBoost json model to identify dead cells.')
+    parser.add_argument('--filter-dead-cells', action='store_true', help='If provided in aggregate mode, dead cells will be excluded from the sum.')
     
     args = parser.parse_args() 
-
-    try: 
-        mp.set_start_method('spawn', force=True) 
-        logging.info("Set multiprocessing start method to 'spawn'.") 
-    except RuntimeError: 
-        logging.warning("Multiprocessing start method already set.") 
-
+    try: mp.set_start_method('spawn', force=True) 
+    except RuntimeError: pass 
     main(args)
