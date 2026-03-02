@@ -300,9 +300,15 @@ def main(args):
         
         pbar = tqdm(total=num_tasks, desc="Overall Progress") 
         last_processed_count = 0 
+        
         while len(results_dict) < num_tasks: 
-            pbar.update(len(results_dict) - last_count); last_count = len(results_dict); time.sleep(2) 
-        pbar.update(num_tasks - last_count); pbar.close() 
+            current_processed_count = len(results_dict) 
+            pbar.update(current_processed_count - last_processed_count) 
+            last_processed_count = current_processed_count 
+            time.sleep(2) 
+            
+        pbar.update(num_tasks - last_processed_count) 
+        pbar.close()
 
         logging.info("All tasks processed. Signaling consumers to shut down.")
         stop_event.set() 
