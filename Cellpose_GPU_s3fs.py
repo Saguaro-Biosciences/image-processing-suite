@@ -313,23 +313,52 @@ def main(args):
         logging.info("All tasks processed. Signaling consumers to shut down.")
         stop_event.set() 
         for c in consumers: c.join() 
+
+        task_queue.close(); task_queue.join_thread()
+        data_queue.close(); data_queue.join_thread()
         logging.info("All processes have completed.") 
 
-        # --- Process Results --- 
+        # --- PROCESS RESULTS --- 
         original_indices = [task[0] for task in tasks]
         raw_results = [results_dict[i] for i in original_indices]
         
         site_features = [item[0] for item in raw_results]
         site_counts = [item[1] for item in raw_results]
         site_coords = [item[2] for item in raw_results]
-        site_dead_flags = [item[3] for item in raw_results]
-        
-        load_data['Cell_Count'] = site_counts
+        site_dead_flags = [item[3] for item in raw_results] 
+
+        # --- Prepare Aggregated Features ---
+        aggregated_features = []
+        final_site_counts = []
+
+        if args.single_cell:
+            # Manually calculate sums from single-cell arrays for the well-level output
+            for feats, flags in zip(site_features, site_dead_flags):
+                if len(feats) == 0:
+                    aggregated_features.append(np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32))
+                    final_site_counts.append(0)
+                else:
+                    if args.xgb_model_path and args.filter_dead_cells:
+                        alive_mask = ~flags
+                        alive_count = np.sum(alive_mask)
+                        if alive_count > 0:
+                            aggregated_features.append(np.sum(feats[alive_mask], axis=0))
+                        else:
+                            aggregated_features.append(np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32))
+                        final_site_counts.append(alive_count)
+                    else:
+                        aggregated_features.append(np.sum(feats, axis=0))
+                        final_site_counts.append(len(feats))
+        else:
+            # Consumers already filtered and summed
+            aggregated_features = site_features
+            final_site_counts = site_counts
+
+        load_data['Cell_Count'] = final_site_counts
         counts_out_path = args.out_data_path.replace('.parquet', '_counts.csv')
-        logging.info(f"Saving site-level cell counts to {counts_out_path}")
         load_data.to_csv(counts_out_path, index=False)
 
-        # --- Opt OUTPUT Save Coordinates Output ---
+        # --- OUTPUT 1: Coordinates ---
         if args.save_coords:
             coords_records = []
             for idx, coords_list, dead_flags in zip(original_indices, site_coords, site_dead_flags):
@@ -337,60 +366,74 @@ def main(args):
                 site = load_data.loc[idx, 'Metadata_Site'] if 'Metadata_Site' in load_data.columns else str(idx)
                 for cell_idx, (y, x) in enumerate(coords_list):
                     is_dead = dead_flags[cell_idx] if len(dead_flags) > 0 else False
-                    coords_records.append({'Cell_ID': f"{well}_{site}_{cell_idx}", 'Y_Center': y, 'X_Center': x, 'Is_Dead': is_dead})
+                    coords_records.append({'Cell_ID': f"{well}_{site}_cell{cell_idx}", 'Y_Center': y, 'X_Center': x, 'Is_Dead': is_dead})
             if coords_records:
                 pd.DataFrame(coords_records).to_parquet(args.out_data_path.replace('.parquet', '_coords.parquet'), engine='pyarrow')
 
-        # --- OUTPUT 2: Features (Branch Logic) ---
+        # --- OUTPUT 2: ALWAYS Output Well-Level Aggregation ---
+        logging.info("Aggregating features to well level...")
+        load_data_agg = load_data.copy()
+        load_data_agg['sum_features'] = aggregated_features
+        metadata_cols = ["Metadata_Well", "Metadata_Timepoint", "Metadata_Plate"] 
         
+        agg_funcs = {'sum_features': lambda s: np.sum(np.stack(s.values), axis=0), 'Cell_Count': 'sum'}
+        for col in metadata_cols: 
+            if col != 'Metadata_Well' and col in load_data_agg.columns: agg_funcs[col] = 'first' 
+
+        well_level_data = load_data_agg.groupby('Metadata_Well').agg(agg_funcs).reset_index()
+        well_level_data['mean_features'] = well_level_data.apply(
+            lambda row: (row['sum_features'] / row['Cell_Count']).tolist() if row['Cell_Count'] > 0 else np.zeros((expected_n_channels, FEATURE_LENGTH)).tolist(), 
+            axis=1
+        )
+        well_level_data = well_level_data.drop(columns=['sum_features'])
+        
+        agg_out_path = args.out_data_path.replace('.parquet', '_well_aggregated.parquet') if args.single_cell else args.out_data_path
+        well_level_data.to_parquet(agg_out_path, engine='pyarrow') 
+        logging.info(f"Saved well-aggregated results to {agg_out_path}")
+
+        # --- OUTPUT 3: OOM-Safe Single-Cell Features ---
         if args.single_cell:
-            logging.info("SINGLE CELL MODE DETECTED: Formatting output...")
-            load_data['features_temp'] = site_features
-            load_data['dead_flags_temp'] = site_dead_flags
+            logging.info("SINGLE CELL MODE DETECTED: Formatting single-cell output safely...")
             
-            valid_sites = load_data[load_data['Cell_Count'] > 0].copy() 
-            if valid_sites.empty:
-                valid_sites.to_parquet(args.out_data_path, engine='pyarrow'); return
+            # Use raw lengths, not filtered cell counts, to ensure rows match extracted arrays
+            valid_mask = [len(f) > 0 for f in site_features]
+            valid_indices = [i for i, v in enumerate(valid_mask) if v]
+            
+            if not valid_indices:
+                logging.warning("No cells detected in dataset. Saving empty parquet.")
+                sc_out_path = args.out_data_path.replace('.parquet', '_single_cell.parquet')
+                load_data.to_parquet(sc_out_path, engine='pyarrow')
+                return
+
+            valid_sites = load_data.iloc[valid_indices].copy()
+            valid_features = [site_features[i] for i in valid_indices]
+            valid_flags = [site_dead_flags[i] for i in valid_indices]
 
             # Expand the dataframe
-            expanded_df = valid_sites.loc[valid_sites.index.repeat([len(f) for f in valid_sites['features_temp']])].copy()
-            # Group by the original index and count sequentially (0, 1, 2, ...)
+            repeats = [len(f) for f in valid_features]
+            expanded_df = valid_sites.loc[valid_sites.index.repeat(repeats)].copy()
             expanded_df['Cell_Index'] = expanded_df.groupby(level=0).cumcount()
             
-            # Unpack the features
-            expanded_df['single_cell_features'] = list(np.vstack(valid_sites['features_temp'].values))
-            expanded_df['single_cell_features'] = expanded_df['single_cell_features'].apply(lambda x: x.tolist())
+            # Free up RAM aggressively before the big stack
+            del load_data, load_data_agg, well_level_data, site_features, site_dead_flags, valid_sites
+            
+            logging.info("Stacking single-cell features...")
+            stacked_features = np.vstack(valid_features)
+            stacked_features_flat = stacked_features.reshape(stacked_features.shape[0], -1)
+            
+            expanded_df['single_cell_features'] = list(stacked_features_flat)
             
             if args.xgb_model_path:
-                expanded_df['is_dead_cell'] = np.concatenate(valid_sites['dead_flags_temp'].values)
+                expanded_df['is_dead_cell'] = np.concatenate(valid_flags)
                 
-            # Drop the temporary columns AND the old Cell_Count
-            expanded_df = expanded_df.drop(columns=['features_temp', 'dead_flags_temp', 'Cell_Count'])
-            
-            expanded_df.to_parquet(args.out_data_path, engine='pyarrow')
+            if 'Cell_Count' in expanded_df.columns:
+                expanded_df = expanded_df.drop(columns=['Cell_Count'])
+                
+            sc_out_path = args.out_data_path.replace('.parquet', '_single_cell.parquet')
+            logging.info(f"Saving SINGLE CELL results to {sc_out_path}...")
+            expanded_df.to_parquet(sc_out_path, engine='pyarrow')
 
-        else:
-            logging.info("Standard Mode: Aggregating features to well level...")
-            load_data['sum_features'] = site_features
-            metadata_cols = ["Metadata_Well", "Metadata_Timepoint", "Metadata_Plate"] 
-            
-            agg_funcs = {'sum_features': lambda s: np.sum(np.stack(s.values), axis=0), 'Cell_Count': 'sum'}
-            for col in metadata_cols: 
-                if col != 'Metadata_Well' and col in load_data.columns: agg_funcs[col] = 'first' 
-
-            well_level_data = load_data.groupby('Metadata_Well').agg(agg_funcs).reset_index()
-            well_level_data['mean_features'] = well_level_data.apply(
-                lambda row: (row['sum_features'] / row['Cell_Count']).tolist() if row['Cell_Count'] > 0 else np.zeros((expected_n_channels, FEATURE_LENGTH)).tolist(), 
-                axis=1
-            )
-            well_level_data.drop(columns=['sum_features']).to_parquet(args.out_data_path, engine='pyarrow')
-
-            logging.info(f"Saving AGGREGATED results to {args.out_data_path}") 
-
-        # Cleanup
-        task_queue.close(); task_queue.join_thread()
-        data_queue.close(); data_queue.join_thread()
-        logging.info("Script finished successfully.") 
+        logging.info("Script finished successfully.")
 
 
 if __name__ == '__main__': 
