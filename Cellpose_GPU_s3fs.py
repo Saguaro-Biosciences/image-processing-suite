@@ -84,7 +84,6 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
 def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels, gpu_id=0, single_cell_mode=False, xgb_model_path=None, filter_dead_cells=False): 
     import os
     import gc 
-    import xgboost as xgb
     
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     internal_device_id = 0
@@ -104,6 +103,7 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_
     # --- Load XGBoost Model ---
     bst = None
     if xgb_model_path:
+        import xgboost as xgb
         logging.info(f"Consumer-{worker_id}: Loading XGBoost model...")
         bst = xgb.Booster()
         bst.load_model(xgb_model_path)
