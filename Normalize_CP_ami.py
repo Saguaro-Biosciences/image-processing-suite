@@ -1,5 +1,6 @@
 import argparse
 import boto3
+from botocore.config import Config
 import pandas as pd
 from io import StringIO
 import numpy as np
@@ -15,8 +16,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def read_csv_from_s3(bucket_name, file_key):
-    s3 = boto3.client('s3')
+
+def read_csv_from_s3(bucket_name, file_key,s3):
     logger.info(f"Reading CSV from s3://{bucket_name}/{file_key}")
     response = s3.get_object(Bucket=bucket_name, Key=file_key)
     csv_content = response['Body'].read().decode('utf-8')
@@ -25,13 +26,22 @@ def read_csv_from_s3(bucket_name, file_key):
     dialect = csv.Sniffer().sniff(sample, delimiters=";,")
     return pd.read_csv(StringIO(csv_content), sep=dialect.delimiter)
 
-def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output_bucket, DMSO, output_prefix, well_agg_func,no_time_subFolder):
-    s3 = boto3.client('s3')
+def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output_bucket, DMSO,output_prefix, well_agg_func,no_time_subFolder,qc_drop):
+    custom_config = Config(
+    connect_timeout=30,  
+    read_timeout=5000,
+    retries={
+        'max_attempts': 3,
+        'mode': 'standard'
+    }     
+    )
+    s3 = boto3.client('s3', config=custom_config)
 
     for plate in plates:
         logger.info(f"Processing plate ID: {plate}")
-        filtered_plateMap = read_csv_from_s3(bucket_name, f"{base_folder_path}/{plate}_PlateMap.csv")
-
+        filtered_plateMap = read_csv_from_s3(bucket_name, f"{base_folder_path}/Plate_{plate.lstrip('binned/')}_PlateMap.csv",s3)
+        filtered_plateMap = filtered_plateMap[['Metadata_Compound', 'Metadata_ConcLevel', 'Metadata_Well', 'Metadata_Plate']]# plate map 
+        filtered_plateMap["Metadata_Compound"] = filtered_plateMap["Metadata_Compound"].apply(lambda x: str(x).upper())
         for time in times:
             logger.info(f"Processing timepoint: {time}")
             table_info = {
@@ -49,26 +59,71 @@ def concatenate_csv_from_s3(bucket_name, plates, times, base_folder_path, output
                     file_key = f"{base_folder_path}/{plate}/{time}/{name}.csv"
                 elif no_time_subFolder:
                     file_key = f"{base_folder_path}/{plate}/{name}.csv"
-                df = read_csv_from_s3(bucket_name, file_key)
+                df = read_csv_from_s3(bucket_name, file_key,s3)
 
+                tables[name] = df  # Save immediately so Image is available
+
+        # Now propagate Metadata_Well using Image table
+            image_df = tables.get("Image")
+            failing_images = image_df.loc[image_df.filter(like='ImageQC_').any(axis=1), 'ImageNumber']
+            for name, df in tables.items():
                 if 'Metadata_Well' not in df.columns:
-                    logger.error(f"Missing 'Metadata_Well' in {file_key}")
-                    raise ValueError(f"Missing required metadata well columns before groupby in {name}.csv")
+                    logger.info(f"'Metadata_Well' missing in {name}, merging from Image.csv using ImageNumber")
+                    df = df.merge(
+                        image_df[['ImageNumber', 'Metadata_Well','Metadata_Site']],
+                        on='ImageNumber',
+                        how='left'
+                    )
+                    tables[name] = df
+                if qc_drop:
+                    logger.info(f"Removing QC failed images for {time}")
+                    tables[name] = df[~df['ImageNumber'].isin(failing_images)]
 
-                tables[name] = df
 
             for name, prefix in table_info.items():
                 df = tables[name]
 
-                df = df.drop(columns=[
-                    col for col in df.columns
-                    if col == 'ImageNumber'
-                    or (col.startswith('Metadata') and col != 'Metadata_Well')
-                    or any(sub in col for sub in drop_substrings)
-                ])
+                if qc_drop:
+                    df = df.drop(columns=[
+                        col for col in df.columns
+                        if col == 'ImageNumber'
+                        or (col.startswith('Metadata') and col not in {'Metadata_Well', 'Metadata_Site'})
+                        or any(sub in col for sub in drop_substrings)
+                    ])
 
-                df = df.rename(columns=lambda x: prefix + x if not x.startswith('Metadata_') else x)
-                df = df.groupby('Metadata_Well', as_index=False).agg(well_agg_func)
+                    df = df.rename(columns=lambda x: prefix + x if not x.startswith('Metadata_') else x)
+                    # Get number of sites per well
+                    site_counts = df.groupby("Metadata_Well")["Metadata_Site"].nunique()
+                    max_sites = site_counts.max()
+
+                    # Compute scaling factors
+                    scaling_factors = (max_sites / site_counts).rename("scaling_factor")
+
+                    # Merge scaling factor into df
+                    df = df.merge(scaling_factors, on="Metadata_Well")
+
+                    # Select integer columns not starting with 'Metadata'
+                    features_to_scale = [
+                        col for col in df.select_dtypes(include="integer").columns 
+                        if not col.startswith("Metadata")
+                    ]
+
+                    # Apply scaling
+                    df[features_to_scale] = df[features_to_scale].multiply(df["scaling_factor"], axis=0)
+
+                    # Clean up and aggregate
+                    df.drop(columns=["scaling_factor","Metadata_Site"], inplace=True)
+
+                else:
+                    df = df.drop(columns=[
+                        col for col in df.columns
+                        if col == 'ImageNumber'
+                        or (col.startswith('Metadata') and col not in {'Metadata_Well'})
+                        or any(sub in col for sub in drop_substrings)
+                    ])
+
+                    df = df.rename(columns=lambda x: prefix + x if not x.startswith('Metadata_') else x)
+                df = df.groupby("Metadata_Well", as_index=False).agg(well_agg_func)
                 tables[name] = df
 
             df_CP_merged = reduce(lambda left, right: pd.merge(left, right, on='Metadata_Well', how='outer'), tables.values())
@@ -106,7 +161,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_bucket",type=str, required=True, help="S3 bucket where output files will be saved.")
     parser.add_argument("--output_prefix", type=str,required=True, help="Prefix for the output files in S3.")
     parser.add_argument("--well_agg_func",type=str, default="mean", help="Function to aggregate at well level. Default mean.")
-    parser.add_argument("--no_time_subFolder",type=str, action='store_true')
+    parser.add_argument("--no_time_subFolder", action='store_true')
+    parser.add_argument("--qc_drop", action='store_true')
 
     args = parser.parse_args()
     logger.info(f"Starting normalization for base folder: {args.base_folder}")
@@ -117,6 +173,7 @@ if __name__ == "__main__":
         plates=args.plates,
         times=args.times,
         no_time_subFolder= args.no_time_subFolder,
+        qc_drop=args.qc_drop,
         DMSO=args.DMSO,
         output_bucket=args.output_bucket,
         output_prefix=args.output_prefix,
