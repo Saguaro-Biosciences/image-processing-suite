@@ -1,6 +1,6 @@
 # Image Processing Suite
 
-This repository contains tools for processing image profiles straight from feature extraction. The tools are designed to run inside a Docker container in the AWS EC2 cloud environment and can also be launched locally.
+This repository contains tools for processing profilling images extracting embedding/feature extraction. The tools are designed to run inside a Docker container that is desplayed on a server (P620) or in the AWS EC2 cloud environment.
 
 ## AWS EC2 Setup
 
@@ -100,10 +100,12 @@ All of the codes relly in the general structure of the results where for a given
 │   ├── 📁 Subset1_10μM_run1/
 │   │   ├── 📁 Plate_1/
 │   │   │   ├── 📁 6h/
-│   │   │   │   └── results.csv
+│   │   │   │   ├── Image.csv
+│   │   │   │   └── CH_illumination.csv
 │   │   │   ├── 📁 12h/
 │   │   │   ├── 📁 24h/
 │   │   │   └── 📁 48h/
+│   │   │   └── results_6h.csv
 │   │   └── Plate_2/
 │   ├── 📁 Subset1_10μM_run2/
 │   └── 📁 Subset1_10μM_run3/    
