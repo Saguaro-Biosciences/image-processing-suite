@@ -64,13 +64,13 @@ response = ssm.send_command(
     InstanceIds=[InstanceID],
     DocumentName="AWS-RunShellScript",  # Use shell script for Linux
     Parameters={'commands': ['sudo docker exec pycyto_container python3 Pycyto_pertime.py \
-        --bucket_name cellprofiler-results \
-        --base_folder IRIC/Progressive_Cpd_Dispensing_outputs \
-        --times Progressive_Dispensing_1add_6h \
-        --output_bucket cellprofiler-results \
-        --output_prefix CQDM/Progressive_Dispensing/Add_1']},
-    OutputS3BucketName="cellprofiler-results",
-    OutputS3KeyPrefix="CQDM_Concat",
+        --bucket_name  \
+        --base_folder  \
+        --times  \
+        --output_bucket  \
+        --output_prefix ']},
+    OutputS3BucketName="",
+    OutputS3KeyPrefix="",
     CloudWatchOutputConfig={
         "CloudWatchLogGroupName": "/aws/ssm/MySSMCommandLogs",
         "CloudWatchOutputEnabled": True
