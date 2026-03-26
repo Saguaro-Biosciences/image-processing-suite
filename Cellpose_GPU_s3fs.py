@@ -285,7 +285,7 @@ def main(args):
 
         consumers = [Process(
             target=consumer_worker, 
-            args=(data_queue, results_dict, stop_event, i, expected_n_channels, i % available_gpus, args.single_cell, args.xgb_model_path)
+            args=(data_queue, results_dict, stop_event, i, expected_n_channels, i % available_gpus, args.xgb_model_path)
         ) for i in range(args.num_consumers)]
 
         logging.info(f"Starting {args.max_workers} producers and {args.num_consumers} consumers...") 
