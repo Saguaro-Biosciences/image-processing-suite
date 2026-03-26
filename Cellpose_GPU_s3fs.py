@@ -445,6 +445,7 @@ def main(args):
 
 if __name__ == '__main__': 
     parser = argparse.ArgumentParser(description="Run cell image analysis pipeline. Takes into account image level QC, XGboost model assesment for dead cells. Singel cell and well level embedding extraction using Efficientnet.")
+    parser.add_argument('--bucket_input', type=str, required=True,help='Base input bucket where the intermediary results lie') 
     parser.add_argument('--data-base-path', type=str, required=True,help='Base path to were the images are stored. ie. /home/storage/Images') 
     parser.add_argument('--num-consumers', type=int, default=2,help='Number of models to be loaded in GPU-vRAM for the embedding extraction. ~ 10 GiB of vRAM per consumer.') 
     parser.add_argument('--max-workers', type=int, default=24,help='Number of workers to prepare the data. 5 per consumer is more than enough. Higher ration risks OOM issues.') 
