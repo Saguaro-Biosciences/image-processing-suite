@@ -84,7 +84,7 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
                 logging.error(f"Producer-{worker_id} failed on site {site_id}: {e}") 
                 data_queue.put((site_id, None))
 
-def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels, gpu_id=0, xgb_model_path=None, filter_dead_cells=False):
+def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels, gpu_id=0, xgb_model_path=None):
     """ 
     Producer Process: Handles GPU taks ONLY. Namely segmentation with cellpose, per channel embedding extraction from the model, dead cell assessment and post processing of the results.
     """
@@ -285,7 +285,7 @@ def main(args):
 
         consumers = [Process(
             target=consumer_worker, 
-            args=(data_queue, results_dict, stop_event, i, expected_n_channels, i % available_gpus, args.single_cell, args.xgb_model_path, args.filter_dead_cells)
+            args=(data_queue, results_dict, stop_event, i, expected_n_channels, i % available_gpus, args.single_cell, args.xgb_model_path)
         ) for i in range(args.num_consumers)]
 
         logging.info(f"Starting {args.max_workers} producers and {args.num_consumers} consumers...") 
@@ -322,7 +322,7 @@ def main(args):
         raw_results = [results_dict[i] for i in original_indices]
         
         site_features = [item[0] for item in raw_results] # Array of n cells for each site
-        site_counts = [item[1] for item in raw_results] # Count of total cells n
+        #site_counts = [item[1] for item in raw_results] # Count of total cells n
         site_coords = [item[2] for item in raw_results] # array of x and y coordinates of cells 
         site_dead_flags = [item[3] for item in raw_results] # boolean array of n cells determining death or alive
 
