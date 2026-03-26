@@ -452,7 +452,7 @@ if __name__ == '__main__':
     parser.add_argument('--load-data-key', type=str, required=True,help='S3 path to the load data file')
     parser.add_argument('--csv-image-key', type=str, required=False,help='S3 path to the Image data file with QC annotations')
     parser.add_argument('--channels', nargs='+', type=str, required=True,help='Channel prefixes as they apper in the load data files. Order is paramount as the first 3 are used for segmentation')
-    parser.add_argument('--out-data-path', type=str, required=True,help='S3 path to the folder where the outputs are desired.') 
+    parser.add_argument('--out_data_path', type=str, required=True,help='S3 path to the folder where the outputs are desired.') 
     parser.add_argument('--single_cell', action='store_true',help='Activates single cell output')
     parser.add_argument('--save-coords', action='store_true',help='Allows for the storage of the cell coordinates.')
     parser.add_argument('--xgb-model-path', type=str, default=None, help='Path to XGBoost json model to classify cells.')
