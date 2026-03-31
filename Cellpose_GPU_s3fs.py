@@ -428,7 +428,8 @@ def main(args):
             stacked_features = np.vstack(valid_features)
             stacked_features_flat = stacked_features.reshape(stacked_features.shape[0], -1)
             
-            expanded_df['single_cell_features'] = list(stacked_features_flat)
+            # 100,000 * 1,280 features =  under the 2.14B limit.
+            expanded_df.to_parquet(sc_out_path, engine='pyarrow', row_group_size=100000)
             
             if args.xgb_model_path:
                 expanded_df['is_dead_cell'] = np.concatenate(valid_flags)
