@@ -14,7 +14,7 @@ from queue import Empty
 import torch.multiprocessing as mp 
 from torch.multiprocessing import Process, Queue, Event 
 
-# --- 1. Setup Logging and Constants --- 
+# --- 1. Setup Logging and Consants --- 
 logging.basicConfig( 
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - [%(processName)s] - %(message)s', 
@@ -406,9 +406,11 @@ def main(args):
             valid_mask = [len(f) > 0 for f in site_features]
             valid_indices = [i for i, v in enumerate(valid_mask) if v]
             
+            # Define the output path early so it's available everywhere
+            sc_out_path = args.out_data_path.replace('.parquet', '_single_cell.parquet')
+            
             if not valid_indices:
                 logging.warning("No cells detected in dataset. Saving empty parquet.")
-                sc_out_path = args.out_data_path.replace('.parquet', '_single_cell.parquet')
                 load_data.to_parquet(sc_out_path, engine='pyarrow')
                 return
 
@@ -425,11 +427,8 @@ def main(args):
             del load_data, load_data_agg, well_level_data, site_features, site_dead_flags, valid_sites
             
             logging.info("Stacking single-cell features...")
-            stacked_features = np.vstack(valid_features)
-            stacked_features_flat = stacked_features.reshape(stacked_features.shape[0], -1)
             
-            # 100,000 * 1,280 features =  under the 2.14B limit.
-            expanded_df.to_parquet(sc_out_path, engine='pyarrow', row_group_size=100000)
+            # --- REMOVED THE PREMATURE SAVE HERE ---
             
             if args.xgb_model_path:
                 expanded_df['is_dead_cell'] = np.concatenate(valid_flags)
@@ -437,9 +436,9 @@ def main(args):
             if 'Cell_Count' in expanded_df.columns:
                 expanded_df = expanded_df.drop(columns=['Cell_Count'])
                 
-            sc_out_path = args.out_data_path.replace('.parquet', '_single_cell.parquet')
             logging.info(f"Saving SINGLE CELL results to {sc_out_path}...")
-            expanded_df.to_parquet(sc_out_path, engine='pyarrow')
+            # 100,000 * 1,280 features =  under the 2.14B limit.
+            expanded_df.to_parquet(sc_out_path, engine='pyarrow', row_group_size=100000)
 
         logging.info("Script finished successfully.")
 
