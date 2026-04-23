@@ -422,12 +422,18 @@ def main(args):
             repeats = [len(f) for f in valid_features]
             expanded_df = valid_sites.loc[valid_sites.index.repeat(repeats)].copy()
             expanded_df['Cell_Index'] = expanded_df.groupby(level=0).cumcount()
-            stacked_features = np.concatenate(valid_features, axis=0)
-            expanded_df['Features'] = stacked_features.tolist()
+            
 
             # Free up RAM aggressively before the big stack
-            del load_data, load_data_agg, well_level_data, site_features, site_dead_flags, valid_sites,stacked_features
+            import gc
+            gc.collect()
+            del load_data, load_data_agg, well_level_data, site_features, site_dead_flags, valid_sites
             
+            stacked_features = np.concatenate(valid_features, axis=0)
+            expanded_df['single_cell_features'] = list(stacked_features)
+
+            del stacked_features, valid_features
+
             logging.info("Stacking single-cell features...")
             
             # --- REMOVED THE PREMATURE SAVE HERE ---
