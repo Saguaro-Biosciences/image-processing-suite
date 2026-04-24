@@ -430,7 +430,7 @@ def main(args):
             del load_data, load_data_agg, well_level_data, site_features, site_dead_flags, valid_sites
             
             stacked_features = np.concatenate(valid_features, axis=0)
-            expanded_df['single_cell_features'] = list(stacked_features)
+            expanded_df['single_cell_features'] = list(stacked_features.reshape(stacked_features.shape[0], -1))
 
             del stacked_features, valid_features
 
