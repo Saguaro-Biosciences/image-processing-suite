@@ -1,4 +1,6 @@
-import os 
+import tempfile
+import shutil
+import os
 import argparse 
 import logging 
 import time 
@@ -84,7 +86,7 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
                 logging.error(f"Producer-{worker_id} failed on site {site_id}: {e}") 
                 data_queue.put((site_id, None))
 
-def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels, gpu_id=0, xgb_model_path=None):
+def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels,temp_dir, gpu_id=0, xgb_model_path=None):
     """ 
     Producer Process: Handles GPU taks ONLY. Namely segmentation with cellpose, per channel embedding extraction from the model, dead cell assessment and post processing of the results.
     """
@@ -120,7 +122,7 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_
 
     def return_empty_result(s_id):
         #Have 0s in case of errors, meaning no cells or corrupeted images. This should never hapen if proper QC was followed.
-        results_dict[s_id] = (np.zeros((0, expected_n_channels, FEATURE_LENGTH), dtype=np.float32), 0, [], np.array([], dtype=bool))
+        results_dict[s_id] = {'status': 'empty', 'n_cells': 0}
 
     while not stop_event.is_set(): 
         try: 
@@ -212,10 +214,13 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_
                     dtrain = xgb.DMatrix(flat_features)
                     preds = bst.predict(dtrain)
                     is_dead = (preds > 0.5) # Boolean array of dead cells
-                
+
+                # Save to disk instead of pushing to Manager dict
+                temp_path = os.path.join(temp_dir, f"site_{site_id}.npz")
+                np.savez_compressed(temp_path, features=reshaped_features, coords=np.array(cell_coords), is_dead=is_dead)
                 
                 # Return all features, count, coords, and the flags
-                results_dict[site_id] = (reshaped_features, n_cells, cell_coords, is_dead)
+                results_dict[site_id] = {'status': 'success', 'filepath': temp_path, 'n_cells': n_cells}
                 logging.info(f"Consumer-{worker_id}: Finished SITE {site_id} ({n_cells} total cells, {np.sum(is_dead)} dead).")
             else:
                 return_empty_result(site_id)
@@ -256,7 +261,9 @@ def main(args):
         for index, row in load_data.iterrows() 
     ] 
     num_tasks = len(tasks) 
-    logging.info(f"Prepared {num_tasks} sites for processing. Out of ") # Add the original dim[1] of the load data set 
+    logging.info(f"Prepared {num_tasks} sites for processing. Out of ")
+    temp_dir = tempfile.mkdtemp(prefix="cellpose_results_")
+    logging.info(f"Created temporary caching directory: {temp_dir}") # Add the original dim[1] of the load data set 
 
     # --- Initialize Multiprocessing Environment --- 
     with mp.Manager() as manager: 
@@ -285,7 +292,7 @@ def main(args):
 
         consumers = [Process(
             target=consumer_worker, 
-            args=(data_queue, results_dict, stop_event, i, expected_n_channels, i % available_gpus, args.xgb_model_path)
+            args=(data_queue, results_dict, stop_event, i, expected_n_channels,temp_dir, i % available_gpus, args.xgb_model_path)
         ) for i in range(args.num_consumers)]
 
         logging.info(f"Starting {args.max_workers} producers and {args.num_consumers} consumers...") 
@@ -321,10 +328,25 @@ def main(args):
         original_indices = [task[0] for task in tasks]
         raw_results = [results_dict[i] for i in original_indices]
         
-        site_features = [item[0] for item in raw_results] # Array of n cells for each site
-        #site_counts = [item[1] for item in raw_results] # Count of total cells n
-        site_coords = [item[2] for item in raw_results] # array of x and y coordinates of cells 
-        site_dead_flags = [item[3] for item in raw_results] # boolean array of n cells determining death or alive
+        site_features = []
+        site_coords = []
+        site_dead_flags = []
+
+        logging.info("Reading temporary files back into main process...")
+        for idx in original_indices:
+            res = results_dict[idx]
+            
+            if res['status'] == 'empty':
+                site_features.append(np.zeros((0, expected_n_channels, FEATURE_LENGTH), dtype=np.float32))
+                site_coords.append([])
+                site_dead_flags.append(np.array([], dtype=bool))
+            else:
+                data = np.load(res['filepath'])
+                site_features.append(data['features'])
+                site_coords.append(data['coords'].tolist()) # Revert to list of tuples
+                site_dead_flags.append(data['is_dead'])
+
+        shutil.rmtree(temp_dir, ignore_errors=True) #Remove tmp files.
 
         # --- Prepare Aggregated Features ---
         aggregated_features = []
