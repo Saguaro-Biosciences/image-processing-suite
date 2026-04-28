@@ -14,7 +14,7 @@ from queue import Empty
 import torch.multiprocessing as mp 
 from torch.multiprocessing import Process, Queue, Event 
 
-# --- 1. Setup Logging and Constants --- 
+# --- 1. Setup Logging and Consants --- 
 logging.basicConfig( 
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - [%(processName)s] - %(message)s', 
@@ -84,7 +84,7 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
                 logging.error(f"Producer-{worker_id} failed on site {site_id}: {e}") 
                 data_queue.put((site_id, None))
 
-def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels, gpu_id=0, xgb_model_path=None, filter_dead_cells=False):
+def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels, gpu_id=0, xgb_model_path=None):
     """ 
     Producer Process: Handles GPU taks ONLY. Namely segmentation with cellpose, per channel embedding extraction from the model, dead cell assessment and post processing of the results.
     """
@@ -285,7 +285,7 @@ def main(args):
 
         consumers = [Process(
             target=consumer_worker, 
-            args=(data_queue, results_dict, stop_event, i, expected_n_channels, i % available_gpus, args.single_cell, args.xgb_model_path, args.filter_dead_cells)
+            args=(data_queue, results_dict, stop_event, i, expected_n_channels, i % available_gpus, args.xgb_model_path)
         ) for i in range(args.num_consumers)]
 
         logging.info(f"Starting {args.max_workers} producers and {args.num_consumers} consumers...") 
@@ -322,7 +322,7 @@ def main(args):
         raw_results = [results_dict[i] for i in original_indices]
         
         site_features = [item[0] for item in raw_results] # Array of n cells for each site
-        site_counts = [item[1] for item in raw_results] # Count of total cells n
+        #site_counts = [item[1] for item in raw_results] # Count of total cells n
         site_coords = [item[2] for item in raw_results] # array of x and y coordinates of cells 
         site_dead_flags = [item[3] for item in raw_results] # boolean array of n cells determining death or alive
 
@@ -406,9 +406,11 @@ def main(args):
             valid_mask = [len(f) > 0 for f in site_features]
             valid_indices = [i for i, v in enumerate(valid_mask) if v]
             
+            # Define the output path early so it's available everywhere
+            sc_out_path = args.out_data_path.replace('.parquet', '_single_cell.parquet')
+            
             if not valid_indices:
                 logging.warning("No cells detected in dataset. Saving empty parquet.")
-                sc_out_path = args.out_data_path.replace('.parquet', '_single_cell.parquet')
                 load_data.to_parquet(sc_out_path, engine='pyarrow')
                 return
 
@@ -421,14 +423,20 @@ def main(args):
             expanded_df = valid_sites.loc[valid_sites.index.repeat(repeats)].copy()
             expanded_df['Cell_Index'] = expanded_df.groupby(level=0).cumcount()
             
+
             # Free up RAM aggressively before the big stack
+            import gc
+            gc.collect()
             del load_data, load_data_agg, well_level_data, site_features, site_dead_flags, valid_sites
             
+            stacked_features = np.concatenate(valid_features, axis=0)
+            expanded_df['single_cell_features'] = list(stacked_features.reshape(stacked_features.shape[0], -1))
+
+            del stacked_features, valid_features
+
             logging.info("Stacking single-cell features...")
-            stacked_features = np.vstack(valid_features)
-            stacked_features_flat = stacked_features.reshape(stacked_features.shape[0], -1)
             
-            expanded_df['single_cell_features'] = list(stacked_features_flat)
+            # --- REMOVED THE PREMATURE SAVE HERE ---
             
             if args.xgb_model_path:
                 expanded_df['is_dead_cell'] = np.concatenate(valid_flags)
@@ -436,26 +444,27 @@ def main(args):
             if 'Cell_Count' in expanded_df.columns:
                 expanded_df = expanded_df.drop(columns=['Cell_Count'])
                 
-            sc_out_path = args.out_data_path.replace('.parquet', '_single_cell.parquet')
             logging.info(f"Saving SINGLE CELL results to {sc_out_path}...")
-            expanded_df.to_parquet(sc_out_path, engine='pyarrow')
+            # 100,000 * 1,280 features =  under the 2.14B limit.
+            expanded_df.to_parquet(sc_out_path, engine='pyarrow', row_group_size=100000)
 
         logging.info("Script finished successfully.")
 
 
 if __name__ == '__main__': 
     parser = argparse.ArgumentParser(description="Run cell image analysis pipeline. Takes into account image level QC, XGboost model assesment for dead cells. Singel cell and well level embedding extraction using Efficientnet.")
-    parser.add_argument('--data-base-path', type=str, required=True,help='Base path to were the images are stored. ie. /home/storage/Images') 
-    parser.add_argument('--num-consumers', type=int, default=2,help='Number of models to be loaded in GPU-vRAM for the embedding extraction. ~ 10 GiB of vRAM per consumer.') 
-    parser.add_argument('--max-workers', type=int, default=24,help='Number of workers to prepare the data. 5 per consumer is more than enough. Higher ration risks OOM issues.') 
-    parser.add_argument('--load-data-key', type=str, required=True,help='S3 path to the load data file')
-    parser.add_argument('--csv-image-key', type=str, required=False,help='S3 path to the Image data file with QC annotations')
+    parser.add_argument('--bucket_input', type=str, required=True,help='Base input bucket where the intermediary results lie') 
+    parser.add_argument('--data_base_path', type=str, required=True,help='Base path to were the images are stored. ie. /home/storage/Images') 
+    parser.add_argument('--num_consumers', type=int, default=2,help='Number of models to be loaded in GPU-vRAM for the embedding extraction. ~ 10 GiB of vRAM per consumer.') 
+    parser.add_argument('--max_workers', type=int, default=24,help='Number of workers to prepare the data. 5 per consumer is more than enough. Higher ration risks OOM issues.') 
+    parser.add_argument('--load_data_key', type=str, required=True,help='S3 path to the load data file')
+    parser.add_argument('--csv_image_key', type=str, required=False,help='S3 path to the Image data file with QC annotations')
     parser.add_argument('--channels', nargs='+', type=str, required=True,help='Channel prefixes as they apper in the load data files. Order is paramount as the first 3 are used for segmentation')
-    parser.add_argument('--out-data-path', type=str, required=True,help='S3 path to the folder where the outputs are desired.') 
+    parser.add_argument('--out_data_path', type=str, required=True,help='S3 path to the folder where the outputs are desired.') 
     parser.add_argument('--single_cell', action='store_true',help='Activates single cell output')
-    parser.add_argument('--save-coords', action='store_true',help='Allows for the storage of the cell coordinates.')
-    parser.add_argument('--xgb-model-path', type=str, default=None, help='Path to XGBoost json model to classify cells.')
-    parser.add_argument('--filter-dead-cells', action='store_true', help='When provided dead cells will be excluded from the aggregation.')
+    parser.add_argument('--save_coords', action='store_true',help='Allows for the storage of the cell coordinates.')
+    parser.add_argument('--xgb_model_path', type=str, default=None, help='Path to XGBoost json model to classify cells.')
+    parser.add_argument('--filter_dead_cells', action='store_true', help='When provided dead cells will be excluded from the aggregation.')
     
     args = parser.parse_args() 
     try: mp.set_start_method('spawn', force=True) 
