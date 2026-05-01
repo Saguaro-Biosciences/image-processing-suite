@@ -1,6 +1,9 @@
 import tempfile
 import shutil
 import os
+import fsspec
+import pyarrow as pa
+import pyarrow.parquet as pq
 import argparse 
 import logging 
 import time 
@@ -323,80 +326,140 @@ def main(args):
         data_queue.close(); data_queue.join_thread()
         logging.info("All processes have completed.") 
 
-        # --- PROCESS RESULTS --- 
-        #unpacking reults
+        # --- PROCESS RESULTS (SINGLE-SITE STREAMING) --- 
+        logging.info("Starting single-pass result processing...")
         original_indices = [task[0] for task in tasks]
-        raw_results = [results_dict[i] for i in original_indices]
         
-        site_features = []
-        site_coords = []
-        site_dead_flags = []
-
-        logging.info("Reading temporary files back into main process...")
-        for idx in original_indices:
-            res = results_dict[idx]
-            
-            if res['status'] == 'empty':
-                site_features.append(np.zeros((0, expected_n_channels, FEATURE_LENGTH), dtype=np.float32))
-                site_coords.append([])
-                site_dead_flags.append(np.array([], dtype=bool))
-            else:
-                data = np.load(res['filepath'])
-                site_features.append(data['features'])
-                site_coords.append(data['coords'].tolist()) # Revert to list of tuples
-                site_dead_flags.append(data['is_dead'])
-
-        shutil.rmtree(temp_dir, ignore_errors=True) #Remove tmp files.
-
-        # --- Prepare Aggregated Features ---
+        # 1. Setup Data Structures for Aggregations & Coordinates
         aggregated_features = []
         final_site_counts = []
         final_dead_counts = []
+        coords_records = []
 
-        #Otput tally of cells per well.
-        for feats, flags in zip(site_features, site_dead_flags):
-            if len(feats) == 0:
+        # 2. Setup Single-Cell Parquet Writer
+        sc_writer = None
+        local_sc_path = None
+        chunk_dfs = []
+        sites_in_chunk = 0
+        CHUNK_SIZE = 500 # Write to disk every 500 sites
+
+        if args.single_cell:
+            sc_out_path = args.out_data_path.replace('.parquet', '_single_cell.parquet')
+            temp_fd, local_sc_path = tempfile.mkstemp(suffix=".parquet")
+            os.close(temp_fd)
+            logging.info("Single-cell writer initialized. Streaming directly to disk...")
+
+        # 3. Main Streaming Loop
+        for idx in tqdm(original_indices, desc="Processing Output"):
+            res = results_dict[idx]
+            well = load_data.loc[idx, 'Metadata_Well']
+            site = load_data.loc[idx, 'Metadata_Site'] if 'Metadata_Site' in load_data.columns else str(idx)
+            
+            if res['status'] == 'empty':
                 aggregated_features.append(np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32))
                 final_site_counts.append(0)
-            else:
-                #Pre porcess feature and remove dead cells / classified cells if requested
-                if args.xgb_model_path and args.filter_dead_cells:
-                    logging.info("Removing dead cells form the aggregates") 
-                    alive_mask = ~flags
-                    alive_count = np.sum(alive_mask)
-                    if alive_count > 0:
-                        aggregated_features.append(np.sum(feats[alive_mask], axis=0))
-                    else:
-                        aggregated_features.append(np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32))
-                    final_site_counts.append(alive_count)
-                    final_dead_counts.append(flags.sum())
-                else:
-                    aggregated_features.append(np.sum(feats, axis=0))
-                    final_site_counts.append(len(feats))
+                if args.xgb_model_path:
+                    final_dead_counts.append(0)
+                continue
 
-        #Add tally of cells and de count of death if classified.
+            # --- A. Load data from disk ---
+            data = np.load(res['filepath'])
+            feats = data['features']
+            coords = data['coords']
+            flags = data['is_dead']
+            n_cells = len(feats)
+
+            # --- B. Coordinates ---
+            if args.save_coords:
+                for cell_idx, (y, x) in enumerate(coords):
+                    is_dead = flags[cell_idx] if len(flags) > 0 else False
+                    coords_records.append({
+                        'Cell_ID': f"{well}_{site}_cell{cell_idx}", 
+                        'Y_Center': y, 
+                        'X_Center': x, 
+                        'Is_Dead': is_dead
+                    })
+
+            # --- C. Well-Level Aggregation ---
+            if args.xgb_model_path and args.filter_dead_cells:
+                alive_mask = ~flags
+                alive_count = np.sum(alive_mask)
+                if alive_count > 0:
+                    aggregated_features.append(np.sum(feats[alive_mask], axis=0))
+                else:
+                    aggregated_features.append(np.zeros((expected_n_channels, FEATURE_LENGTH), dtype=np.float32))
+                final_site_counts.append(alive_count)
+                final_dead_counts.append(flags.sum())
+            else:
+                aggregated_features.append(np.sum(feats, axis=0))
+                final_site_counts.append(n_cells)
+                if args.xgb_model_path:
+                    final_dead_counts.append(flags.sum())
+
+            # --- D. Single-Cell Chunking ---
+            if args.single_cell and n_cells > 0:
+                site_meta = load_data.iloc[[idx]].copy()
+                site_df = site_meta.loc[site_meta.index.repeat(n_cells)].copy()
+                site_df['Cell_Index'] = np.arange(n_cells)
+                
+                # Flatten features: (n_cells, channels, feature_len) -> (n_cells, channels * feature_len)
+                site_df['single_cell_features'] = list(feats.reshape(n_cells, -1))
+
+                if args.xgb_model_path:
+                    site_df['is_dead_cell'] = flags
+                if 'Cell_Count' in site_df.columns:
+                    site_df = site_df.drop(columns=['Cell_Count'])
+
+                chunk_dfs.append(site_df)
+                sites_in_chunk += 1
+
+                # If chunk is full, write it to the Parquet file and clear RAM
+                if sites_in_chunk >= CHUNK_SIZE:
+                    combined_chunk = pd.concat(chunk_dfs, ignore_index=True)
+                    table = pa.Table.from_pandas(combined_chunk)
+                    
+                    if sc_writer is None:
+                        sc_writer = pq.ParquetWriter(local_sc_path, table.schema)
+                    sc_writer.write_table(table)
+                    
+                    chunk_dfs = []
+                    sites_in_chunk = 0
+                    del combined_chunk, table
+                    import gc
+                    gc.collect()
+
+            # --- E. FREE UP RAM  ---
+            # Guarantees we never accumulate massive arrays in memory
+            del feats, coords, flags, data
+
+        # Flush any remaining single-cell chunks after the loop finishes
+        if args.single_cell and chunk_dfs:
+            combined_chunk = pd.concat(chunk_dfs, ignore_index=True)
+            table = pa.Table.from_pandas(combined_chunk)
+            if sc_writer is None:
+                sc_writer = pq.ParquetWriter(local_sc_path, table.schema)
+            sc_writer.write_table(table)
+            
+        if args.single_cell and sc_writer:
+            sc_writer.close()
+
+        # Clean up temp directory of NPZ files
+        shutil.rmtree(temp_dir, ignore_errors=True) 
+
+        # --- 4. FINALIZE & SAVE OUTPUTS ---
+        
+        # Save Counts
         load_data['Cell_Count'] = final_site_counts
         if args.xgb_model_path:
             load_data['Dead_Cells'] = final_dead_counts
-        
-        counts_out_path = args.out_data_path.replace('.parquet', '_counts.csv')
-        load_data.to_csv(counts_out_path, index=False)
+        load_data.to_csv(args.out_data_path.replace('.parquet', '_counts.csv'), index=False)
 
-        # --- OUTPUT 1: Coordinates ---
-        if args.save_coords:
-            coords_records = []
-            for idx, coords_list, dead_flags in zip(original_indices, site_coords, site_dead_flags):
-                well = load_data.loc[idx, 'Metadata_Well']
-                site = load_data.loc[idx, 'Metadata_Site'] if 'Metadata_Site' in load_data.columns else str(idx)
-                for cell_idx, (y, x) in enumerate(coords_list):
-                    is_dead = dead_flags[cell_idx] if len(dead_flags) > 0 else False
-                    coords_records.append({'Cell_ID': f"{well}_{site}_cell{cell_idx}", 'Y_Center': y, 'X_Center': x, 'Is_Dead': is_dead})
-            if coords_records:
-                pd.DataFrame(coords_records).to_parquet(args.out_data_path.replace('.parquet', '_coords.parquet'), engine='pyarrow')
+        # Save Coordinates
+        if args.save_coords and coords_records:
+            pd.DataFrame(coords_records).to_parquet(args.out_data_path.replace('.parquet', '_coords.parquet'), engine='pyarrow')
 
-        # --- OUTPUT 2: ALWAYS Output Well-Level Aggregation ---
-        #Data here reaches already filtered if args.filter_dead_cells is given. Else, it remains complete
-        logging.info("Aggregating features to well level...")
+        # Save Well Aggregation
+        logging.info("Formatting well-level aggregations...")
         load_data_agg = load_data.copy()
         load_data_agg['sum_features'] = aggregated_features
         metadata_cols = ["Metadata_Well", "Metadata_Timepoint", "Metadata_Plate"] 
@@ -413,62 +476,20 @@ def main(args):
         well_level_data = well_level_data.drop(columns=['sum_features'])
         
         if args.filter_dead_cells:
-            # What to do if the argument IS present/true
             agg_out_path = args.out_data_path.replace('.parquet', '_filtered_well_aggregated.parquet')
         else:
             agg_out_path = args.out_data_path.replace('.parquet', '_well_aggregated.parquet')
         well_level_data.to_parquet(agg_out_path, engine='pyarrow') 
         logging.info(f"Saved well-aggregated results to {agg_out_path}")
 
-        # --- OUTPUT 3: OOM-Safe Single-Cell Features ---
-        if args.single_cell:
-            logging.info("SINGLE CELL MODE DETECTED: Formatting single-cell output safely...")
-            
-            # Use raw lengths, not filtered cell counts, to ensure rows match extracted arrays
-            valid_mask = [len(f) > 0 for f in site_features]
-            valid_indices = [i for i, v in enumerate(valid_mask) if v]
-            
-            # Define the output path early so it's available everywhere
-            sc_out_path = args.out_data_path.replace('.parquet', '_single_cell.parquet')
-            
-            if not valid_indices:
-                logging.warning("No cells detected in dataset. Saving empty parquet.")
-                load_data.to_parquet(sc_out_path, engine='pyarrow')
-                return
-
-            valid_sites = load_data.iloc[valid_indices].copy()
-            valid_features = [site_features[i] for i in valid_indices]
-            valid_flags = [site_dead_flags[i] for i in valid_indices]
-
-            # Explode the dataframe
-            repeats = [len(f) for f in valid_features]
-            expanded_df = valid_sites.loc[valid_sites.index.repeat(repeats)].copy()
-            expanded_df['Cell_Index'] = expanded_df.groupby(level=0).cumcount()
-            
-
-            # Free up RAM aggressively before the big stack
-            import gc
-            gc.collect()
-            del load_data, load_data_agg, well_level_data, site_features, site_dead_flags, valid_sites
-            
-            stacked_features = np.concatenate(valid_features, axis=0)
-            expanded_df['single_cell_features'] = list(stacked_features.reshape(stacked_features.shape[0], -1))
-
-            del stacked_features, valid_features
-
-            logging.info("Stacking single-cell features...")
-            
-            # --- REMOVED THE PREMATURE SAVE HERE ---
-            
-            if args.xgb_model_path:
-                expanded_df['is_dead_cell'] = np.concatenate(valid_flags)
-                
-            if 'Cell_Count' in expanded_df.columns:
-                expanded_df = expanded_df.drop(columns=['Cell_Count'])
-                
-            logging.info(f"Saving SINGLE CELL results to {sc_out_path}...")
-            # 100,000 * 1,280 features =  under the 2.14B limit.
-            expanded_df.to_parquet(sc_out_path, engine='pyarrow', row_group_size=100000)
+        # Transfer Single-Cell File to S3
+        if args.single_cell and local_sc_path and os.path.exists(local_sc_path):
+            logging.info(f"Transferring SINGLE CELL results to S3: {sc_out_path}...")
+            with open(local_sc_path, 'rb') as f_in:
+                with fsspec.open(sc_out_path, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            os.remove(local_sc_path)
+            logging.info("SINGLE CELL transfer complete.")
 
         logging.info("Script finished successfully.")
 
