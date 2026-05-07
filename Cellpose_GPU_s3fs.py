@@ -239,6 +239,11 @@ def main(args):
     """ 
     Main function to orchestrate the Producer-Consumer pipeline. Get inputs and get format outputs. 
     """ 
+    #Wakeup for the image folder
+    try:
+        os.listdir(args.data_base_path)
+    except Exception:
+        pass
     logging.info(f"Starting analysis with parameters: {args}") 
 
     # --- Load Data --- 
