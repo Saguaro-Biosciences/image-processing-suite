@@ -2,6 +2,7 @@ import tempfile
 import shutil
 import os
 import fsspec
+import subprocess
 import pyarrow as pa
 import pyarrow.parquet as pq
 import argparse 
@@ -47,79 +48,69 @@ def scale_to_8bit(image_16bit):
 
 # --- 2. Producer-Consumer Worker Functions --- 
 
-def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key): 
+def producer_worker(task_queue, data_queue, worker_id, channels, csv_image_key): 
     """ 
-    Producer Process: Handles CPU-bound I/O tasks ONLY. Namely, loading and and aplying illumination correction arrays.
+    Producer Process: Handles CPU-bound I/O tasks ONLY. Namely, loading and applying illumination correction arrays.
     Preparing the data for the consumer queue.  
     """ 
     logging.info(f"Producer-{worker_id} started.") 
+    
     if csv_image_key:
         try:
-            #Loads and applies Illumination correction arrays.
+            # Loads and applies Illumination correction arrays.
             channel_correction = [np.load(f'{csv_image_key}/{c}_illum.npy') for c in channels]
             logging.info(f"Producer-{worker_id} loaded correction arrays.")
         except Exception as e:
             logging.error(f"Producer-{worker_id} FAILED to load correction arrays: {e}")
             return
 
-    import subprocess
-import time
-import logging
-import tifffile
-import numpy as np
+    while True: 
+        task = task_queue.get() 
+        if task is None: 
+            logging.info(f"Producer-{worker_id} received sentinel. Shutting down.") 
+            break 
 
-# ... (rest of your setup code) ...
+        site_id, site_image_paths = task 
+        
+        max_retries = 5
+        retries = 0
+        success = False
+        
+        while retries < max_retries and not success:
+            try: 
+                if csv_image_key:
+                    # Loads in memory the channels for the specific site-task to be fed into the consumer
+                    all_channels = [tifffile.imread(path)/channel_correction[n] for n,path in enumerate(site_image_paths)] 
+                else:
+                    # Loads without correction
+                    all_channels = [tifffile.imread(path) for path in site_image_paths] 
+                    
+                image_4ch = np.stack(all_channels, axis=-1) 
+                data_queue.put((site_id, image_4ch)) 
+                success = True # Flag success to exit the retry loop
 
-while True: 
-    task = task_queue.get() 
-    if task is None: 
-        logging.info(f"Producer-{worker_id} received sentinel. Shutting down.") 
-        break 
-
-    site_id, site_image_paths = task 
-    
-    max_retries = 5
-    retries = 0
-    success = False
-    
-    while retries < max_retries and not success:
-        try: 
-            if csv_image_key:
-                # Loads in memory the channels for the specific site-task
-                all_channels = [tifffile.imread(path)/channel_correction[n] for n, path in enumerate(site_image_paths)] 
-            else:
-                # Loads without correction
-                all_channels = [tifffile.imread(path) for path in site_image_paths] 
+            except PermissionError as e: 
+                # Specifically catches [Errno 13] Permission denied
+                logging.warning(f"Producer-{worker_id} PermissionError on site {site_id}. Restarting autofs... (Attempt {retries + 1}/{max_retries})")
                 
-            image_4ch = np.stack(all_channels, axis=-1) 
-            data_queue.put((site_id, image_4ch))
-            success = True # Marks the task as successful to exit the retry loop
+                try:
+                    subprocess.run(["sudo", "systemctl", "restart", "autofs"], check=True)
+                    time.sleep(10) # Give the OS a moment to remount
+                except subprocess.CalledProcessError as sub_e:
+                    logging.error(f"Producer-{worker_id} failed to restart autofs: {sub_e}")
+                    
+                retries += 1
 
-        except PermissionError as e: 
-            # This specifically catches [Errno 13] Permission denied
-            logging.warning(f"Producer-{worker_id} encountered Errno 13 on site {site_id}. Restarting autofs... (Attempt {retries + 1}/{max_retries})")
-            
-            try:
-                # Trigger the restart command
-                subprocess.run(["sudo", "systemctl", "restart", "autofs"], check=True)
+            except Exception as e: 
+                # Catches any other errors (corrupt file, etc.)
+                logging.error(f"Producer-{worker_id} failed on site {site_id} with error: {e}") 
+                data_queue.put((site_id, None)) 
+                break # Exit the retry loop for non-permission errors
                 
-                # Sleep briefly to give the OS time to remount the drives before the next loop iteration
-                time.sleep(2) 
-            except subprocess.CalledProcessError as sub_e:
-                logging.error(f"Producer-{worker_id} failed to restart autofs: {sub_e}")
-                
-            retries += 1
-
-        except Exception as e: 
-            # Catches any other non-permission errors (like missing files, corrupt tiffs, etc.)
-            logging.error(f"Producer-{worker_id} failed on site {site_id} with general error: {e}") 
-            data_queue.put((site_id, None)) 
-            break # Break out of the retry loop since restarting autofs won't fix this
-
-    #exhausted our retries and still didn't succeed
-    if not success and retries >= max_retries:
-        logging.error(f"Producer-{worker_id} permanently failed on site {site_id} after {max_retries} autofs restarts.")
-        data_queue.put((site_id, None))
+        # If the loop finished but we never succeeded (exhausted retries)
+        if not success and retries >= max_retries:
+            logging.error(f"Producer-{worker_id} permanently failed on site {site_id} after {max_retries} autofs restarts.")
+            data_queue.put((site_id, None))
 
 def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels,temp_dir, gpu_id=0, xgb_model_path=None):
     """ 
