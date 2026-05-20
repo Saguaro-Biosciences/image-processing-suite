@@ -51,6 +51,49 @@ def max_projection(image_group, bucket_name, s3_client):
     output_key = modify_imagepath(image_group[0])
     s3_client.upload_fileobj(output_stream, bucket_name, output_key)
 
+def max_projection_3slices(image_group, bucket_name, s3_client):
+
+    needed_slices = {2, 3, 4}
+    images = {}
+
+    # Identify which image corresponds to which Z slice
+    for key in image_group:
+        z = extract_z_slice(os.path.basename(key))
+
+        if z in needed_slices:
+            response = s3_client.get_object(Bucket=bucket_name, Key=key)
+            image_data = response['Body'].read()
+            img = imageio.imread(io.BytesIO(image_data))
+            images[z] = img
+
+    if len(images) < 3:
+        logger.warning(f"Missing required slices in group: {image_group}")
+        return
+
+    # Check shapes
+    shapes = [img.shape for img in images.values()]
+    if not all(s == shapes[0] for s in shapes):
+        raise ValueError(f"Image shape mismatch in group: {image_group}")
+
+    projections = {
+        "Z002_Z003_Z004": [2, 3, 4]
+    }
+
+    for label, zlist in projections.items():
+
+        subset = [images[z] for z in zlist]
+        max_proj = np.maximum.reduce(subset)
+
+        output_stream = io.BytesIO()
+        imageio.imwrite(output_stream, max_proj, format="tiff")
+        output_stream.seek(0)
+
+        output_key = modify_imagepath(image_group[0])
+        root, ext = os.path.splitext(output_key)
+        output_key = f"{root}_{label}{ext}"
+
+        s3_client.upload_fileobj(output_stream, bucket_name, output_key)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process image plates using ImageJ and upload results to S3.")
     parser.add_argument("--bucket_data_set",type=str, required=True, help="S3 bucket containing the data set.")
@@ -88,7 +131,7 @@ if __name__ == "__main__":
                                        chunk.iloc[j + (p * num_channels)].Image_FileName)
                         for p in range(num_planes)
                     ]
-                    max_projection(image_group, bucket_images, s3_client)
+                    max_projection_3slices(image_group, bucket_images, s3_client)
                 except Exception as e:
                     logger.error(f"Error processing group {j} in chunk starting at {i} for plate {plate}: {e}")
 
