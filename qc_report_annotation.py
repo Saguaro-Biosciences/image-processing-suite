@@ -28,7 +28,7 @@ def main():
     # Construct the S3 key exactly based on Nextflow inputs
     features_key = f"{args.work_path}/{args.plate}/{args.time}/Image.csv"
     
-    print(f"📦 Processing: {args.time} {args.plate}")
+    print(f"Processing: {args.time} {args.plate}")
     
     try:
         df = read_csv_from_s3(bucket_name, features_key)
