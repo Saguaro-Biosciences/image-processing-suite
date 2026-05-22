@@ -426,7 +426,7 @@ def main(args):
 
             # --- D. Single-Cell Chunking ---
             if args.single_cell and n_cells > 0:
-                site_meta = load_data.iloc[[idx]].copy()
+                site_meta = load_data.loc[[idx]].copy()
                 site_df = site_meta.loc[site_meta.index.repeat(n_cells)].copy()
                 site_df['Cell_Index'] = np.arange(n_cells)
                 
