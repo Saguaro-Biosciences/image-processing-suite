@@ -528,7 +528,7 @@ if __name__ == '__main__':
     parser.add_argument('--data-base-path', type=str, required=True,help='Base path to were the images are stored. ie. /home/storage/Images') 
     parser.add_argument('--num-consumers', type=int, default=2,help='Number of models to be loaded in GPU-vRAM for the embedding extraction. ~ 10 GiB of vRAM per consumer.') 
     parser.add_argument('--max-workers', type=int, default=24,help='Number of workers to prepare the data. 5 per consumer is more than enough. Higher ration risks OOM issues.') 
-    parser.add_argument('--load-data_key', type=str, required=True,help='S3 path to the load data file')
+    parser.add_argument('--load-data-key', type=str, required=True,help='S3 path to the load data file')
     parser.add_argument('--csv-image-key', type=str, required=False,help='S3 path to the Image data file with QC annotations')
     parser.add_argument('--channels', nargs='+', type=str, required=True,help='Channel prefixes as they apper in the load data files. Order is paramount as the first 3 are used for segmentation')
     parser.add_argument('--out-data-path', type=str, required=True,help='S3 path to the folder where the outputs are desired.') 
