@@ -104,10 +104,10 @@ def main():
 
     fig.update_layout(height=430 * len(all_traces), width=800, title_text=f"Feature Distributions with QC for {args.time}", template='simple_white', barmode='overlay')
 
-    # Save HTML to the CURRENT WORKING DIRECTORY so Nextflow captures it
-    html_filename = f"{args.work_path}/{args.plate}/{args.time}/qc_plots_{args.plate}_{args.time}.html"
+    # Save HTML directly to the current working directory so Nextflow can grab it
+    html_filename = f"qc_plots_{args.plate}_{args.time}.html"
     pio.write_html(fig, file=html_filename, auto_open=False)
-    print(f"💾 HTML saved: {html_filename}")
+    print(f"HTML saved locally for Nextflow: {html_filename}")
 
     # Save modified CSV back to S3
     csv_buffer = StringIO()
