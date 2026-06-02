@@ -2,6 +2,7 @@ import tempfile
 import shutil
 import os
 import fsspec
+import subprocess
 import pyarrow as pa
 import pyarrow.parquet as pq
 import argparse 
@@ -47,15 +48,16 @@ def scale_to_8bit(image_16bit):
 
 # --- 2. Producer-Consumer Worker Functions --- 
 
-def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key): 
+def producer_worker(task_queue, data_queue, worker_id, channels, csv_image_key): 
     """ 
-    Producer Process: Handles CPU-bound I/O tasks ONLY. Namely, loading and and aplying illumination correction arrays.
+    Producer Process: Handles CPU-bound I/O tasks ONLY. Namely, loading and applying illumination correction arrays.
     Preparing the data for the consumer queue.  
     """ 
     logging.info(f"Producer-{worker_id} started.") 
+    
     if csv_image_key:
         try:
-            #Loads and applies Illumination correction arrays.
+            # Loads and applies Illumination correction arrays.
             channel_correction = [np.load(f'{csv_image_key}/{c}_illum.npy') for c in channels]
             logging.info(f"Producer-{worker_id} loaded correction arrays.")
         except Exception as e:
@@ -69,25 +71,46 @@ def producer_worker(task_queue, data_queue, worker_id,channels,csv_image_key):
             break 
 
         site_id, site_image_paths = task 
-        if csv_image_key:
-            #Loads in memory the channels for the specific site-task to be fed into the consumer
+        
+        max_retries = 5
+        retries = 0
+        success = False
+        
+        while retries < max_retries and not success:
             try: 
-                all_channels = [tifffile.imread(path)/channel_correction[n] for n,path in enumerate(site_image_paths)] 
+                if csv_image_key:
+                    # Loads in memory the channels for the specific site-task to be fed into the consumer
+                    all_channels = [tifffile.imread(path)/channel_correction[n] for n,path in enumerate(site_image_paths)] 
+                else:
+                    # Loads without correction
+                    all_channels = [tifffile.imread(path) for path in site_image_paths] 
+                    
                 image_4ch = np.stack(all_channels, axis=-1) 
                 data_queue.put((site_id, image_4ch)) 
+                success = True # Flag success to exit the retry loop
+
+            except PermissionError as e: 
+                # Specifically catches [Errno 13] Permission denied
+                logging.warning(f"Producer-{worker_id} PermissionError on site {site_id}. Restarting autofs... (Attempt {retries + 1}/{max_retries})")
+                
+                try:
+                    subprocess.run(["sudo", "systemctl", "restart", "autofs"], check=True)
+                    time.sleep(10) # Give the OS a moment to remount
+                except subprocess.CalledProcessError as sub_e:
+                    logging.error(f"Producer-{worker_id} failed to restart autofs: {sub_e}")
+                    
+                retries += 1
 
             except Exception as e: 
-                logging.error(f"Producer-{worker_id} failed on site {site_id}: {e}") 
+                # Catches any other errors (corrupt file, etc.)
+                logging.error(f"Producer-{worker_id} failed on site {site_id} with error: {e}") 
                 data_queue.put((site_id, None)) 
-        else:
-            try: 
-                all_channels = [tifffile.imread(path) for path in site_image_paths] 
-                image_4ch = np.stack(all_channels, axis=-1) 
-                data_queue.put((site_id, image_4ch)) 
-
-            except Exception as e: 
-                logging.error(f"Producer-{worker_id} failed on site {site_id}: {e}") 
-                data_queue.put((site_id, None))
+                break # Exit the retry loop for non-permission errors
+                
+        # If the loop finished but we never succeeded (exhausted retries)
+        if not success and retries >= max_retries:
+            logging.error(f"Producer-{worker_id} permanently failed on site {site_id} after {max_retries} autofs restarts.")
+            data_queue.put((site_id, None))
 
 def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels,temp_dir, gpu_id=0, xgb_model_path=None):
     """ 
@@ -403,7 +426,7 @@ def main(args):
 
             # --- D. Single-Cell Chunking ---
             if args.single_cell and n_cells > 0:
-                site_meta = load_data.iloc[[idx]].copy()
+                site_meta = load_data.loc[[idx]].copy()
                 site_df = site_meta.loc[site_meta.index.repeat(n_cells)].copy()
                 site_df['Cell_Index'] = np.arange(n_cells)
                 
@@ -501,18 +524,18 @@ def main(args):
 
 if __name__ == '__main__': 
     parser = argparse.ArgumentParser(description="Run cell image analysis pipeline. Takes into account image level QC, XGboost model assesment for dead cells. Singel cell and well level embedding extraction using Efficientnet.")
-    parser.add_argument('--bucket_input', type=str, required=True,help='Base input bucket where the intermediary results lie') 
-    parser.add_argument('--data_base_path', type=str, required=True,help='Base path to were the images are stored. ie. /home/storage/Images') 
-    parser.add_argument('--num_consumers', type=int, default=2,help='Number of models to be loaded in GPU-vRAM for the embedding extraction. ~ 10 GiB of vRAM per consumer.') 
-    parser.add_argument('--max_workers', type=int, default=24,help='Number of workers to prepare the data. 5 per consumer is more than enough. Higher ration risks OOM issues.') 
-    parser.add_argument('--load_data_key', type=str, required=True,help='S3 path to the load data file')
-    parser.add_argument('--csv_image_key', type=str, required=False,help='S3 path to the Image data file with QC annotations')
+    parser.add_argument('--bucket-input', type=str, required=True,help='Base input bucket where the intermediary results lie') 
+    parser.add_argument('--data-base-path', type=str, required=True,help='Base path to were the images are stored. ie. /home/storage/Images') 
+    parser.add_argument('--num-consumers', type=int, default=2,help='Number of models to be loaded in GPU-vRAM for the embedding extraction. ~ 10 GiB of vRAM per consumer.') 
+    parser.add_argument('--max-workers', type=int, default=24,help='Number of workers to prepare the data. 5 per consumer is more than enough. Higher ration risks OOM issues.') 
+    parser.add_argument('--load-data-key', type=str, required=True,help='S3 path to the load data file')
+    parser.add_argument('--csv-image-key', type=str, required=False,help='S3 path to the Image data file with QC annotations')
     parser.add_argument('--channels', nargs='+', type=str, required=True,help='Channel prefixes as they apper in the load data files. Order is paramount as the first 3 are used for segmentation')
-    parser.add_argument('--out_data_path', type=str, required=True,help='S3 path to the folder where the outputs are desired.') 
-    parser.add_argument('--single_cell', action='store_true',help='Activates single cell output')
-    parser.add_argument('--save_coords', action='store_true',help='Allows for the storage of the cell coordinates.')
-    parser.add_argument('--xgb_model_path', type=str, default=None, help='Path to XGBoost json model to classify cells.')
-    parser.add_argument('--filter_dead_cells', action='store_true', help='When provided dead cells will be excluded from the aggregation.')
+    parser.add_argument('--out-data-path', type=str, required=True,help='S3 path to the folder where the outputs are desired.') 
+    parser.add_argument('--single-cell', action='store_true',help='Activates single cell output')
+    parser.add_argument('--save-coords', action='store_true',help='Allows for the storage of the cell coordinates.')
+    parser.add_argument('--xgb-model-path', type=str, default=None, help='Path to XGBoost json model to classify cells.')
+    parser.add_argument('--filter-dead-cells', action='store_true', help='When provided dead cells will be excluded from the aggregation.')
     
     args = parser.parse_args() 
     try: mp.set_start_method('spawn', force=True) 
