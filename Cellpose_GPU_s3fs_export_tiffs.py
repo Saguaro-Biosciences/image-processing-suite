@@ -333,16 +333,36 @@ def main(args):
 
     # --- Read dead-cell flags from the existing single-cell parquet ---
     # Only the lightweight columns are read (NOT single_cell_features). dead_map maps each
-    # site index (__index_level_0__, == load_data row index) to a boolean array of is_dead_cell
-    # ordered by Cell_Index.
+    # site index to a boolean array of is_dead_cell ordered by Cell_Index. The site index is
+    # the parquet's __index_level_0__ column when present; otherwise we fall back to the
+    # DataFrame's own index (sc.index), which pandas restores from the parquet's stored index.
     dead_map = None
     if args.single_cell_parquet:
         logging.info(f"Reading dead-cell flags from {args.single_cell_parquet}")
         try:
-            sc = pd.read_parquet(args.single_cell_parquet,
-                                 columns=['__index_level_0__', 'Cell_Index', 'is_dead_cell'])
+            import pyarrow.parquet as pq
+
+            # Inspect the schema (footer only, no row data; works over S3 via fsspec) to see
+            # whether the explicit site-index column exists, so we never request a missing one.
+            with fsspec.open(args.single_cell_parquet, 'rb') as f:
+                available_cols = set(pq.ParquetFile(f).schema.names)
+            has_idx_col = '__index_level_0__' in available_cols
+
+            read_cols = (['__index_level_0__'] if has_idx_col else []) + ['Cell_Index', 'is_dead_cell']
+            sc = pd.read_parquet(args.single_cell_parquet, columns=read_cols)
+
+            # SAFEGUARD: group by __index_level_0__ when it is a real column; otherwise fall
+            # back to the DataFrame's own index (sc.index) as the site key.
+            if '__index_level_0__' in sc.columns:
+                group_key = sc['__index_level_0__']
+            else:
+                group_key = sc.index
+                if not has_idx_col:
+                    logging.warning("single-cell parquet has no '__index_level_0__' column -> "
+                                    "grouping by the DataFrame index (sc.index) instead.")
+
             dead_map = {}
-            for site_idx, grp in sc.groupby('__index_level_0__'):
+            for site_idx, grp in sc.groupby(group_key):
                 ordered = grp.sort_values('Cell_Index')
                 dead_map[int(site_idx)] = ordered['is_dead_cell'].to_numpy().astype(bool)
             logging.info(f"Loaded dead-cell flags for {len(dead_map)} sites.")
