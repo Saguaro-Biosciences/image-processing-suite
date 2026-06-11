@@ -36,6 +36,24 @@ BOX_SIZE = 200  # Box size in pixels for the per-cell crop (same as the original
 
 
 # --- Helper Functions ---
+def scale_to_8bit(image_16bit):
+    """
+    Per-(crop, channel) min-max stretch to 8-bit, IDENTICAL to the inference pipeline
+    (Cellpose_GPU_s3fs.py). This is the treatment EfficientNet sees, so the exported
+    TIFFs must apply it too: it both (a) makes the crops match the model's training
+    distribution and (b) makes them display correctly in any viewer (raw float crops
+    with values >> 1 otherwise clip to a solid white mask).
+
+    Because the background is masked to 0, min is ~0 and this reduces to 255 * x / max.
+    """
+    min_val, max_val = np.min(image_16bit), np.max(image_16bit)
+    if max_val == min_val:
+        return np.zeros(image_16bit.shape, dtype=np.uint8)
+
+    scaled_image = 255.0 * (image_16bit.astype(np.float32) - min_val) / (max_val - min_val)
+    return scaled_image.astype(np.uint8)
+
+
 def parse_name_prefix(data_base_path):
     """
     Build the filename prefix from the data base path.
@@ -245,8 +263,12 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_
                 binary_mask = (masks[y1:y2, x1:x2] == target_id)  # (BOX_SIZE, BOX_SIZE) bool
                 for ch_idx in range(n_channels):
                     # Masked crop for this channel: cell pixels keep their (corrected) intensity,
-                    # everything outside the cell mask is zeroed.
-                    crop = (image_4ch[y1:y2, x1:x2, ch_idx] * binary_mask).astype(np.float32)
+                    # everything outside the cell mask is zeroed. Then apply the SAME 8-bit
+                    # scaling the inference pipeline feeds EfficientNet, so the exported TIFF is
+                    # exactly what the model sees (and displays correctly instead of clipping to
+                    # a white mask).
+                    masked = image_4ch[y1:y2, x1:x2, ch_idx] * binary_mask
+                    crop = scale_to_8bit(masked)
                     fname = f"{name_prefix}_{well}_{site}_cell{cell_k}_{channels[ch_idx]}.tiff"
                     uri = f"{out_tiff_dir}/{fname}"
 
