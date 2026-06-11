@@ -240,23 +240,27 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_
                 record(site_id, 'empty')
                 continue
 
-            # --- 3. Determine alive cells from the existing single-cell parquet ---
-            is_dead_arr = dead_map.get(site_key) if dead_map is not None else None
+            # --- 3. Determine dead cells from the existing single-cell parquet ---
+            # dead_set holds the Cell_Index values flagged dead for THIS site. We filter
+            # per cell by its number (cell_k == Cell_Index); we do NOT drop the whole site.
+            site_info = dead_map.get(site_key) if dead_map is not None else None
+            dead_set = site_info['dead'] if site_info is not None else None
+            parquet_total = site_info['total'] if site_info is not None else None
 
-            # SAFEGUARD: if the re-segmentation does not reproduce the original cell count
-            # for this site, the Cell_Index alignment is broken -> skip to avoid mislabeling.
-            if is_dead_arr is not None and len(is_dead_arr) != n_segmented:
+            # A cell-count difference vs the parquet is recorded for QC but is NOT a skip:
+            # cells are still filtered individually by Cell_Index.
+            mismatch = (parquet_total is not None and parquet_total != n_segmented)
+            if mismatch:
                 logging.warning(
-                    f"Consumer-{worker_id}: SITE {site_id} cell-count MISMATCH "
-                    f"(re-segmented={n_segmented}, parquet={len(is_dead_arr)}). Skipping export."
+                    f"Consumer-{worker_id}: SITE {site_id} cell-count differs "
+                    f"(re-segmented={n_segmented}, parquet={parquet_total}). Proceeding with "
+                    f"per-Cell_Index filtering (alive cells still exported)."
                 )
-                record(site_id, 'mismatch', n_segmented=n_segmented, mismatch=True)
-                continue
 
             # --- 4. Write masked per-channel crops for ALIVE cells ---
             n_alive, n_dead = 0, 0
             for (cell_k, y1, y2, x1, x2, target_id) in kept:
-                if is_dead_arr is not None and bool(is_dead_arr[cell_k]):
+                if dead_set is not None and cell_k in dead_set:
                     n_dead += 1
                     continue
 
@@ -280,7 +284,8 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_
                         f.write(buf.getvalue())
                 n_alive += 1
 
-            record(site_id, 'success', n_segmented=n_segmented, n_alive=n_alive, n_dead=n_dead)
+            record(site_id, 'success', n_segmented=n_segmented, n_alive=n_alive, n_dead=n_dead,
+                   mismatch=mismatch)
             logging.info(f"Consumer-{worker_id}: SITE {site_id} exported {n_alive} alive cells "
                          f"({n_dead} dead skipped, {n_segmented} segmented).")
 
@@ -361,11 +366,19 @@ def main(args):
                     logging.warning("single-cell parquet has no '__index_level_0__' column -> "
                                     "grouping by the DataFrame index (sc.index) instead.")
 
+            # dead_map[site] = {'dead': set of Cell_Index values flagged dead, 'total': cell count}.
+            # Keyed by the ACTUAL Cell_Index (not by position): the consumer removes exactly
+            # "cell X of site Y" by its number and never drops a whole site on a count mismatch.
             dead_map = {}
             for site_idx, grp in sc.groupby(group_key):
-                ordered = grp.sort_values('Cell_Index')
-                dead_map[int(site_idx)] = ordered['is_dead_cell'].to_numpy().astype(bool)
-            logging.info(f"Loaded dead-cell flags for {len(dead_map)} sites.")
+                dead_idx = grp.loc[grp['is_dead_cell'].astype(bool), 'Cell_Index']
+                dead_map[int(site_idx)] = {
+                    'dead': set(dead_idx.astype(int).tolist()),
+                    'total': int(len(grp)),
+                }
+            n_dead_total = sum(len(v['dead']) for v in dead_map.values())
+            logging.info(f"Loaded dead-cell flags for {len(dead_map)} sites "
+                         f"({n_dead_total} cells flagged dead).")
         except Exception as e:
             logging.error(f"Failed to read single-cell parquet ({e}). Exporting ALL cells "
                           f"(no dead-cell filtering).")
@@ -485,10 +498,12 @@ def main(args):
         logging.info(f"Export complete. {total_exported} alive cells exported across "
                      f"{len(summary)} sites. Summary -> {summary_path}")
         if dead_map is not None and n_mismatch > 0:
-            logging.warning(f"{n_mismatch} sites had a cell-count mismatch vs the parquet and were "
-                            f"NOT exported. If this count is large, the segmentation is not "
-                            f"reproducing the original numbering (check Cellpose/torch version and "
-                            f"that the SAME illumination correction is applied).")
+            logging.warning(f"{n_mismatch} sites had a cell-count difference vs the parquet "
+                            f"(still exported; dead cells filtered by Cell_Index). If this count "
+                            f"is large, the segmentation may not be reproducing the original "
+                            f"numbering (check Cellpose/torch version and that the SAME "
+                            f"illumination correction is applied), so Cell_Index alignment is "
+                            f"less reliable.")
         logging.info("Script finished successfully.")
 
 
