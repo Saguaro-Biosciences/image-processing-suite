@@ -72,11 +72,15 @@ def sniff_delimiter(sample):
 
 def read_csv_local(file_path):
     logger.info(f"Reading CSV from local disk: {file_path}")
+    # Only read a small sample for delimiter sniffing — don't load the whole
+    # file into memory as a string. For large tables (Cells.csv especially),
+    # doing that first and then re-parsing via StringIO roughly doubles peak
+    # memory and loses pandas' fast C-parser file streaming, which can turn
+    # a multi-GB file into a multi-hour (or effectively hung) read.
     with open(file_path, 'r', encoding='utf-8') as f:
-        csv_content = f.read()
-    sample = csv_content[:1024]
+        sample = f.read(1024)
     delimiter = sniff_delimiter(sample)
-    return pd.read_csv(StringIO(csv_content), sep=delimiter)
+    return pd.read_csv(file_path, sep=delimiter)
 
 
 def read_csv_from_s3(bucket_name, file_key, s3):
