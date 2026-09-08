@@ -9,6 +9,7 @@ from pycytominer import annotate, normalize
 import csv
 import logging
 
+#Boilerplate versioning
 # --- Logger Setup ---
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
