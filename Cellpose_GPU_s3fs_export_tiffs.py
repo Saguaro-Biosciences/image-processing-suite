@@ -3,7 +3,6 @@ import os
 import time
 import logging
 import argparse
-import subprocess
 
 import fsspec
 import tifffile
@@ -33,6 +32,7 @@ logging.basicConfig(
 # different settings.
 CELLPOSE_MODEL = 'nuclei'
 BOX_SIZE = 200  # Box size in pixels for the per-cell crop (same as the original pipeline)
+MAX_CELLS_PER_IMAGE = 50  # Cap on exported alive cells per site (Cell_Index order); 0 = no cap
 
 
 # --- Helper Functions ---
@@ -76,6 +76,39 @@ def parse_name_prefix(data_base_path):
     return f"{plate}_{run}_{timepoint}"
 
 
+def preflight_check_readable(tasks, sample=64):
+    """
+    Spot-check that the source TIFFs are actually readable before committing GPU time.
+
+    Samples file paths evenly across the whole task list (rather than taking the first N,
+    which would miss a partially-broken acquisition folder) and tries to open each one.
+    Returns None if every sampled file opened, else (n_unreadable, [example paths]).
+    """
+    all_paths = [p for _, paths in tasks for p in paths]
+    if not all_paths:
+        return None
+
+    step = max(1, len(all_paths) // sample)
+    probe = all_paths[::step][:sample]
+
+    bad = []
+    for path in probe:
+        try:
+            with open(path, 'rb') as fh:
+                fh.read(4)
+        except PermissionError:
+            bad.append(path)
+        except OSError:
+            # Missing/transient errors are handled per-site by the producers; preflight is
+            # only meant to catch the systematic permission failure.
+            pass
+
+    if not bad:
+        logging.info(f"Preflight OK: {len(probe)} sampled source files are readable.")
+        return None
+    return len(bad), bad[:5]
+
+
 # --- 2. Producer-Consumer Worker Functions ---
 
 def producer_worker(task_queue, data_queue, worker_id, channels, csv_image_key):
@@ -104,7 +137,10 @@ def producer_worker(task_queue, data_queue, worker_id, channels, csv_image_key):
 
         site_id, site_image_paths = task
 
-        max_retries = 5
+        # Retries exist for genuinely transient NFS faults (timeouts, stale handles), which
+        # do benefit from backing off. Permission errors are excluded below: they are a
+        # persistent property of the file, so retrying them only wastes time.
+        max_retries = 3
         retries = 0
         success = False
 
@@ -122,28 +158,36 @@ def producer_worker(task_queue, data_queue, worker_id, channels, csv_image_key):
                 data_queue.put((site_id, image_4ch))
                 success = True  # Flag success to exit the retry loop
 
-            except PermissionError:
-                # Specifically catches [Errno 13] Permission denied
-                logging.warning(f"Producer-{worker_id} PermissionError on site {site_id}. "
-                                f"Restarting autofs... (Attempt {retries + 1}/{max_retries})")
-                try:
-                    subprocess.run(["sudo", "systemctl", "restart", "autofs"], check=True)
-                    time.sleep(10)  # Give the OS a moment to remount
-                except subprocess.CalledProcessError as sub_e:
-                    logging.error(f"Producer-{worker_id} failed to restart autofs: {sub_e}")
+            except PermissionError as e:
+                # [Errno 13] on the NAS is NOT a transient mount fault: the source TIFFs are
+                # mode 000 on the server (see preflight_check_readable). Restarting autofs was
+                # measured to have zero effect on readability and, because every producer does
+                # it at once on a busy mount, it thrashes the automounter for the whole box.
+                # So: report the unreadable file and give up on this site immediately.
+                logging.error(f"Producer-{worker_id} PermissionError on site {site_id}: {e}. "
+                              f"Source file is unreadable (check its mode on the NAS); "
+                              f"skipping site.")
+                data_queue.put((site_id, None))
+                break
+
+            except OSError as e:
+                # Transient NFS-level fault (timeout, stale handle, connection reset). Back off
+                # and retry; the sleep is OUTSIDE any inner try so it always actually happens.
                 retries += 1
+                if retries >= max_retries:
+                    logging.error(f"Producer-{worker_id} permanently failed on site {site_id} "
+                                  f"after {max_retries} attempts: {e}")
+                    data_queue.put((site_id, None))
+                else:
+                    logging.warning(f"Producer-{worker_id} I/O error on site {site_id}: {e}. "
+                                    f"Retrying in {2 ** retries}s ({retries}/{max_retries}).")
+                    time.sleep(2 ** retries)
 
             except Exception as e:
                 # Catches any other errors (corrupt file, etc.)
                 logging.error(f"Producer-{worker_id} failed on site {site_id} with error: {e}")
                 data_queue.put((site_id, None))
                 break  # Exit the retry loop for non-permission errors
-
-        # If the loop finished but we never succeeded (exhausted retries)
-        if not success and retries >= max_retries:
-            logging.error(f"Producer-{worker_id} permanently failed on site {site_id} "
-                          f"after {max_retries} autofs restarts.")
-            data_queue.put((site_id, None))
 
 
 def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_channels,
@@ -284,6 +328,11 @@ def consumer_worker(data_queue, results_dict, stop_event, worker_id, expected_n_
                         f.write(buf.getvalue())
                 n_alive += 1
 
+                # Stop after MAX_CELLS_PER_IMAGE exported cells: we only need a subset per
+                # site, and the kept list is in Cell_Index order so the subset is deterministic.
+                if MAX_CELLS_PER_IMAGE and n_alive >= MAX_CELLS_PER_IMAGE:
+                    break
+
             record(site_id, 'success', n_segmented=n_segmented, n_alive=n_alive, n_dead=n_dead,
                    mismatch=mismatch)
             logging.info(f"Consumer-{worker_id}: SITE {site_id} exported {n_alive} alive cells "
@@ -403,6 +452,26 @@ def main(args):
     ]
     num_tasks = len(tasks)
     logging.info(f"Prepared {num_tasks} sites for processing.")
+
+    # --- Preflight: refuse to start on unreadable input ---
+    # Source TIFFs on the NAS are sometimes left mode 000, which used to surface as a flood of
+    # per-site PermissionErrors mid-run and a SILENTLY truncated export. Sample the inputs up
+    # front so an unreadable dataset fails immediately instead of after hours of GPU time.
+    unreadable = (preflight_check_readable(tasks, sample=args.preflight_sample)
+                  if args.preflight_sample > 0 else None)
+    if unreadable:
+        n_bad, examples = unreadable
+        logging.error(
+            f"PREFLIGHT FAILED: {n_bad}/{args.preflight_sample} sampled source files are "
+            f"unreadable (permission denied). This is a file-mode problem on the NAS, not a "
+            f"mount fault -- restarting autofs will NOT fix it. Fix the modes on the NAS "
+            f"(e.g. 'chmod -R a+rX' on the acquisition folder) and re-run. Examples:"
+        )
+        for p in examples:
+            logging.error(f"  {p}")
+        if not args.ignore_preflight:
+            raise SystemExit(2)
+        logging.warning("--ignore-preflight set: continuing, export WILL be incomplete.")
 
     # --- S3 output directory for the TIFFs ---
     out_base = args.out_data_path.rsplit('/', 1)[0]
@@ -524,6 +593,12 @@ if __name__ == '__main__':
                         help='Number of CPU producers that prepare the data.')
     parser.add_argument('--load-data-key', type=str, required=True,
                         help='S3 key (within --bucket-input) to the load_data CSV.')
+    parser.add_argument('--preflight-sample', type=int, default=64,
+                        help='How many source files to spot-check for readability before '
+                             'starting. Set 0 to disable the check.')
+    parser.add_argument('--ignore-preflight', action='store_true',
+                        help='Continue even if the preflight readability check fails. The '
+                             'export will be incomplete; only use for deliberate partial runs.')
     parser.add_argument('--csv-image-key', type=str, required=False,
                         help='Path to the folder with Image.csv (for QC filtering) and the '
                              '<channel>_illum.npy correction arrays. MUST match the original run.')
