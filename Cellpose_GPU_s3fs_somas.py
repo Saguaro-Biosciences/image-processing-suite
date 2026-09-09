@@ -233,8 +233,44 @@ def segment_somas_dna_contrast(cell_model, image_4ch, dna_index, diameter=100,
 NETWORK_LOG2R_EDGES = np.arange(-0.5, 3.0 + 1e-9, 0.25)      # 15 edges -> 16 bins
 NETWORK_N_BINS = len(NETWORK_LOG2R_EDGES) + 1
 NETWORK_OCC_MULT = ((2 ** 0.5, "1_4"), (2.0, "2"), (4.0, "4"), (8.0, "8"))
-NETWORK_FEATURE_NAMES = ([f"hist{k:02d}" for k in range(NETWORK_N_BINS)]
-                         + [f"occ_{lab}xB" for _, lab in NETWORK_OCC_MULT])
+NETWORK_RIDGE_THRESH = (0.02, 0.05, 0.15)
+NETWORK_SKEL_LOG2R = 1.0        # network mask = pixels above 2x background
+NETWORK_MIN_OBJ = 64            # drop specks below this before skeletonising
+
+# Representative value of each histogram bin, in "signal above background" units,
+# used for the Gini coefficient without needing the sorted pixel list.
+_NET_MIDS = np.concatenate([[NETWORK_LOG2R_EDGES[0] - 0.125],
+                            (NETWORK_LOG2R_EDGES[:-1] + NETWORK_LOG2R_EDGES[1:]) / 2,
+                            [NETWORK_LOG2R_EDGES[-1] + 0.125]])
+NETWORK_BIN_VALUE = np.maximum(2.0 ** _NET_MIDS - 1.0, 0.0)
+
+_NET_HIST = [f"hist{k:02d}" for k in range(NETWORK_N_BINS)]
+_NET_OCC = [f"occ_{lab}xB" for _, lab in NETWORK_OCC_MULT]
+_NET_SHAPE = ["hist_entropy", "log2r_mean", "log2r_var", "log2r_skew",
+              "log2r_kurt", "gini_above_bg"]
+_NET_RIDGE = ["ridge_mean"] + [f"ridge_occ_{t}" for t in NETWORK_RIDGE_THRESH]
+_NET_MORPH = ["frac_network", "skel_density", "branch_density", "end_density"]
+
+# Two selectable metric sets.
+#   "distribution"  the original 16 bins + 4 occupancy thresholds.
+#   "full"          the recommended set. The 4 occupancy values are DROPPED because
+#                   they are exact cumulative sums of the histogram bins and so add
+#                   no independent information; in their place go descriptors that
+#                   are genuinely non-redundant. On plate 3z/24h the distribution-
+#                   only set had a participation ratio of 2.4 -- 160 columns
+#                   carrying about two and a half independent numbers, with PC1
+#                   alone at 62% of the variance and 13 of 14 hits moving along it.
+#                   Shape, ridge and morphology descriptors are not derivable from
+#                   the bins, so they should raise that effective dimensionality.
+NETWORK_METRIC_SETS = {
+    "distribution": _NET_HIST + _NET_OCC,
+    "full": _NET_HIST + _NET_SHAPE + _NET_RIDGE + _NET_MORPH,
+}
+NETWORK_FEATURE_NAMES = NETWORK_METRIC_SETS["distribution"]   # legacy default
+
+
+def network_feature_names(metric_set="full"):
+    return NETWORK_METRIC_SETS[metric_set]
 
 
 def network_estimate_background(px, n_bins=512, hi_pct=60.0):
@@ -274,33 +310,62 @@ def _network_tile_origins(shape, tile, n_tiles, seed):
                           rng.integers(0, w - tile + 1, n_tiles)))
 
 
-def network_distribution_metrics(plane, soma, tile=125, n_tiles=256, seed=0,
-                                 min_valid_frac=0.25):
+def _network_channel_maps(plane, valid, need_heavy):
     """
-    16-level distribution + 4 occupancy thresholds for one channel.
+    Whole-channel maps computed once, then simply sliced per tile.
 
-    The 16 bins are fixed steps of log2(pixel / B) from 0.71x to 8x background,
-    with a catch-all above -- fixed rather than learned per plate, so vectors from
-    different plates are directly comparable.
-
-    Soma pixels are EXCLUDED from the statistics rather than counted as
-    background: filling them would make each tile's signal fractions depend on how
-    many cells happen to sit in it, which is the confound the network descriptor
-    exists to avoid.
-
-    Returns (mean_vector, sd_vector, info) over tiles, each of length
-    len(NETWORK_FEATURE_NAMES). Tiles that are mostly soma are skipped.
+    Doing the Sato filter and skeletonisation per tile would be both slower and
+    wrong -- ridge filters need context beyond a 125 px window, and a skeleton cut
+    at a tile edge sprouts spurious end points.
     """
-    valid = ~soma
-    if valid.sum() < 1000:
-        n = len(NETWORK_FEATURE_NAMES)
-        return np.full(n, np.nan), np.full(n, np.nan), {"n_tiles_used": 0, "B": np.nan}
-
     B = network_estimate_background(plane[valid])
     ratio = plane / max(B, 1e-6)
-    # bin index map computed once for the whole channel; each tile is then a slice
-    idx = np.digitize(np.log2(np.maximum(ratio, 1e-9)), NETWORK_LOG2R_EDGES)
-    occ_maps = [(ratio > m) for m, _ in NETWORK_OCC_MULT]
+    log2r = np.log2(np.maximum(ratio, 1e-9))
+    maps = {"B": B, "ratio": ratio, "log2r": log2r,
+            "idx": np.digitize(log2r, NETWORK_LOG2R_EDGES)}
+    if need_heavy:
+        from skimage.filters import sato
+        from skimage.morphology import skeletonize, remove_small_objects
+        import scipy.ndimage as ndi
+        # Sato runs on the dimensionless ratio image, so fixed thresholds stay
+        # comparable across wells and plates with different gain.
+        maps["ridge"] = sato(ratio, sigmas=(1, 2, 4), black_ridges=False)
+        net = remove_small_objects(ratio > 2.0 ** NETWORK_SKEL_LOG2R,
+                                   min_size=NETWORK_MIN_OBJ)
+        skel = skeletonize(net)
+        nb = ndi.convolve(skel.astype(np.uint8), np.ones((3, 3), np.uint8),
+                          mode="constant") - skel
+        maps.update(net=net, skel=skel, branch=skel & (nb >= 3), endp=skel & (nb == 1))
+    return maps
+
+
+def network_tile_metrics(plane, soma, tile=125, n_tiles=256, seed=0,
+                         min_valid_frac=0.25, metric_set="full"):
+    """
+    Per-tile network descriptors for one channel, summarised over tiles.
+
+    Soma pixels are EXCLUDED rather than counted as background: filling them would
+    make each tile's signal fractions depend on how many cells happen to sit in it,
+    which is the confound this descriptor exists to avoid.
+
+    metric_set:
+      "distribution"  16 log2-ratio bins + 4 occupancy thresholds (original).
+      "full"          16 bins + shape + ridge + morphology, occupancy dropped as
+                      redundant. See NETWORK_METRIC_SETS.
+
+    Returns (mean_vector, sd_vector, info) over tiles, in the order given by
+    network_feature_names(metric_set).
+    """
+    names = network_feature_names(metric_set)
+    valid = ~soma
+    if valid.sum() < 1000:
+        n = len(names)
+        return np.full(n, np.nan), np.full(n, np.nan), {"n_tiles_used": 0, "B": np.nan}
+
+    heavy = metric_set == "full"
+    M = _network_channel_maps(plane, valid, heavy)
+    B, ratio, log2r, idx = M["B"], M["ratio"], M["log2r"], M["idx"]
+    occ_maps = [(ratio > m) for m, _ in NETWORK_OCC_MULT] if metric_set == "distribution" else []
 
     tile, origins = _network_tile_origins(plane.shape, tile, n_tiles, seed)
     rows = []
@@ -310,17 +375,42 @@ def network_distribution_metrics(plane, soma, tile=125, n_tiles=256, seed=0,
         n_valid = int(keep.sum())
         if n_valid < min_valid_frac * tile * tile:
             continue
-        h = np.bincount(idx[sy, sx][keep], minlength=NETWORK_N_BINS).astype(np.float64)
-        h /= n_valid
-        occ = [float(o[sy, sx][keep].mean()) for o in occ_maps]
-        rows.append(np.concatenate([h, occ]))
+        h = np.bincount(idx[sy, sx][keep], minlength=NETWORK_N_BINS).astype(np.float64) / n_valid
+        rec = list(h)
+
+        if metric_set == "distribution":
+            rec += [float(o[sy, sx][keep].mean()) for o in occ_maps]
+        else:
+            lr = log2r[sy, sx][keep]
+            nz = h[h > 0]
+            entropy = float(-(nz * np.log2(nz)).sum())
+            mu = float(lr.mean()); var = float(max(lr.var(), 1e-12))
+            c = lr - mu
+            skew = float((c ** 3).mean() / var ** 1.5)
+            kurt = float((c ** 4).mean() / var ** 2 - 3.0)
+            v, w = NETWORK_BIN_VALUE, h
+            mean_v = float(w @ v)
+            gini = float((w @ np.abs(v[:, None] - v[None, :]) @ w) / (2 * mean_v)) if mean_v > 0 else np.nan
+            rec += [entropy, mu, var, skew, kurt, gini]
+            rr = M["ridge"][sy, sx][keep]
+            rec += [float(rr.mean())] + [float((rr > t).mean()) for t in NETWORK_RIDGE_THRESH]
+            for nm in ("net", "skel", "branch", "endp"):
+                rec.append(float((M[nm][sy, sx] & keep).sum() / n_valid))
+        rows.append(rec)
 
     if not rows:
-        n = len(NETWORK_FEATURE_NAMES)
+        n = len(names)
         return np.full(n, np.nan), np.full(n, np.nan), {"n_tiles_used": 0, "B": B}
-    R = np.vstack(rows)
+    R = np.asarray(rows, float)
     sd = R.std(0, ddof=1) if len(R) > 1 else np.zeros(R.shape[1])
     return R.mean(0), sd, {"n_tiles_used": len(R), "B": B}
+
+
+# Backwards-compatible alias for the original distribution-only entry point.
+def network_distribution_metrics(plane, soma, tile=125, n_tiles=256, seed=0,
+                                 min_valid_frac=0.25):
+    return network_tile_metrics(plane, soma, tile, n_tiles, seed,
+                                min_valid_frac, metric_set="distribution")
 
 
 def network_embed_tiles(plane, soma, processor, feature_model, device,
@@ -377,12 +467,13 @@ def compute_network_features(image_4ch, masks, cfg, processor=None,
     if cfg["metrics"]:
         means, sds, backgrounds, used = [], [], [], []
         for ci in cfg["channel_indices"]:
-            m, s, info = network_distribution_metrics(
+            m, s, info = network_tile_metrics(
                 image_4ch[..., ci].astype(np.float32), soma,
-                tile=cfg["metric_tile"], n_tiles=cfg["metric_n_tiles"], seed=seed)
+                tile=cfg["metric_tile"], n_tiles=cfg["metric_n_tiles"], seed=seed,
+                metric_set=cfg.get("metric_set", "full"))
             means.append(m); sds.append(s)
             backgrounds.append(info["B"]); used.append(info["n_tiles_used"])
-        out["metrics_mean"] = np.vstack(means).astype(np.float32)   # (n_ch, 20)
+        out["metrics_mean"] = np.vstack(means).astype(np.float32)   # (n_ch, n_features)
         out["metrics_sd"] = np.vstack(sds).astype(np.float32)
         out["metrics_background"] = np.array(backgrounds, np.float32)
         out["metrics_n_tiles"] = np.array(used, np.int32)
@@ -736,6 +827,7 @@ def main(args):
                 "dilate": args.network_dilate,
                 "metrics": args.network_metrics,
                 "embeddings": args.network_embeddings,
+                "metric_set": args.network_metric_set,
                 "metric_tile": args.network_metric_tile,
                 "metric_n_tiles": args.network_metric_tiles,
                 "embed_tile": args.network_embed_tile,
@@ -743,7 +835,9 @@ def main(args):
                 "save_tiles": args.network_save_tiles,
             }
             logging.info(f"Network descriptors ON for channels {net_names} "
-                         f"(metrics={args.network_metrics} @ {args.network_metric_tile}px x{args.network_metric_tiles}, "
+                         f"(metrics={args.network_metrics} [{args.network_metric_set}: "
+                         f"{len(network_feature_names(args.network_metric_set))} features] "
+                         f"@ {args.network_metric_tile}px x{args.network_metric_tiles}, "
                          f"embeddings={args.network_embeddings} @ {args.network_embed_tile}px x{args.network_embed_tiles})")
 
         # --- Start Consumers ---
@@ -922,6 +1016,7 @@ def main(args):
         # FINALIZE block below runs after the cleanup on the next line.
         if network_cfg is not None:
             net_names = network_cfg["channel_names"]
+            feat_names = network_feature_names(network_cfg.get("metric_set", "full"))
             n_missing = 0
             for idx in original_indices:
                 npz_path = results_dict[idx].get('network_path')
@@ -937,7 +1032,7 @@ def main(args):
                 if 'metrics_mean' in d:
                     row = dict(meta)
                     for ci, ch in enumerate(net_names):
-                        for fi, fname in enumerate(NETWORK_FEATURE_NAMES):
+                        for fi, fname in enumerate(feat_names):
                             row[f'Net_{ch}_{fname}_mean'] = float(d['metrics_mean'][ci, fi])
                             row[f'Net_{ch}_{fname}_sd'] = float(d['metrics_sd'][ci, fi])
                         row[f'Net_{ch}_background'] = float(d['metrics_background'][ci])
@@ -1067,6 +1162,13 @@ if __name__ == '__main__':
                          help='Channel names (subset of --channels) to describe the network '
                               'on. Defaults to every channel EXCEPT the DNA one, which is a '
                               'segmentation input rather than a network readout.')
+    parser.add_argument('--network-metric-set', choices=['full', 'distribution'], default='full',
+                         help="Which metric definitions to compute. 'full' (default) = 16 "
+                              "log2-ratio bins + shape + ridge + morphology; the 4 occupancy "
+                              "thresholds are omitted because they are exact cumulative sums "
+                              "of the bins and add no independent information. 'distribution' "
+                              "= the original 16 bins + 4 occupancy. 'full' costs roughly 3x "
+                              "more CPU per channel because of the Sato ridge filter.")
     parser.add_argument('--network-metric-tile', type=int, default=125,
                          help='Tile size (px) for --network-metrics. Default 125.')
     parser.add_argument('--network-metric-tiles', type=int, default=256,
