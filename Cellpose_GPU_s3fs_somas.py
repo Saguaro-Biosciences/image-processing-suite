@@ -798,6 +798,7 @@ def main(args):
         final_dead_counts = []
         coords_records = []
         seg_qc_records = []  # per-site DNA-contrast segmentation QC info
+        net_metric_rows, net_embed_rows = [], []  # axon-network descriptors, read before temp cleanup
  
         # 2. Setup Single-Cell Parquet Writer
         sc_writer = None
@@ -916,6 +917,40 @@ def main(args):
         if args.single_cell and sc_writer:
             sc_writer.close()
  
+        # --- Collect axon-network descriptors BEFORE the temp dir is removed ---
+        # These npz files live in temp_dir, so they must be read here; the
+        # FINALIZE block below runs after the cleanup on the next line.
+        if network_cfg is not None:
+            net_names = network_cfg["channel_names"]
+            n_missing = 0
+            for idx in original_indices:
+                npz_path = results_dict[idx].get('network_path')
+                if not npz_path or not os.path.exists(npz_path):
+                    n_missing += 1
+                    continue
+                d = np.load(npz_path)
+                meta = {'Metadata_Well': load_data.loc[idx, 'Metadata_Well'],
+                        'Metadata_Site': load_data.loc[idx, 'Metadata_Site']
+                        if 'Metadata_Site' in load_data.columns else str(idx),
+                        'Network_Soma_Area_Frac': float(d['soma_area_frac']),
+                        'Network_N_Somas': int(d['n_somas'])}
+                if 'metrics_mean' in d:
+                    row = dict(meta)
+                    for ci, ch in enumerate(net_names):
+                        for fi, fname in enumerate(NETWORK_FEATURE_NAMES):
+                            row[f'Net_{ch}_{fname}_mean'] = float(d['metrics_mean'][ci, fi])
+                            row[f'Net_{ch}_{fname}_sd'] = float(d['metrics_sd'][ci, fi])
+                        row[f'Net_{ch}_background'] = float(d['metrics_background'][ci])
+                        row[f'Net_{ch}_n_tiles'] = int(d['metrics_n_tiles'][ci])
+                    net_metric_rows.append(row)
+                if 'embeddings' in d:
+                    net_embed_rows.append(dict(meta, network_embedding=d['embeddings'].tolist()))
+            logging.info(f"Network descriptors collected: {len(net_metric_rows)} metric rows, "
+                         f"{len(net_embed_rows)} embedding rows ({n_missing} sites had none).")
+            if not net_metric_rows and not net_embed_rows:
+                logging.error("Network descriptors were requested but NOTHING was collected -- "
+                              "check that the consumers wrote network_*.npz into the temp dir.")
+
         # Clean up temp directory of NPZ files
         shutil.rmtree(temp_dir, ignore_errors=True)
  
@@ -934,34 +969,10 @@ def main(args):
             )
             logging.info("Saved per-site segmentation QC (DNA-contrast filter diagnostics).")
  
-        # Save Axon-network descriptors (site level and well level)
+        # Save Axon-network descriptors (rows were collected before temp cleanup)
         if network_cfg is not None:
-            net_names = network_cfg["channel_names"]
-            metric_rows, embed_rows = [], []
-            for idx in original_indices:
-                npz_path = results_dict[idx].get('network_path')
-                if not npz_path or not os.path.exists(npz_path):
-                    continue
-                d = np.load(npz_path)
-                meta = {'Metadata_Well': load_data.loc[idx, 'Metadata_Well'],
-                        'Metadata_Site': load_data.loc[idx, 'Metadata_Site']
-                        if 'Metadata_Site' in load_data.columns else str(idx),
-                        'Network_Soma_Area_Frac': float(d['soma_area_frac']),
-                        'Network_N_Somas': int(d['n_somas'])}
-                if 'metrics_mean' in d:
-                    row = dict(meta)
-                    for ci, ch in enumerate(net_names):
-                        for fi, fname in enumerate(NETWORK_FEATURE_NAMES):
-                            row[f'Net_{ch}_{fname}_mean'] = float(d['metrics_mean'][ci, fi])
-                            row[f'Net_{ch}_{fname}_sd'] = float(d['metrics_sd'][ci, fi])
-                        row[f'Net_{ch}_background'] = float(d['metrics_background'][ci])
-                        row[f'Net_{ch}_n_tiles'] = int(d['metrics_n_tiles'][ci])
-                    metric_rows.append(row)
-                if 'embeddings' in d:
-                    embed_rows.append(dict(meta, network_embedding=d['embeddings'].tolist()))
-
-            if metric_rows:
-                mdf = pd.DataFrame(metric_rows)
+            if net_metric_rows:
+                mdf = pd.DataFrame(net_metric_rows)
                 mdf.to_parquet(args.out_data_path.replace('.parquet', '_network_metrics.parquet'),
                                engine='pyarrow')
                 num = [c for c in mdf.columns if c.startswith('Net_') or c.startswith('Network_')]
@@ -970,13 +981,12 @@ def main(args):
                     engine='pyarrow')
                 logging.info(f"Saved network metrics for {len(mdf)} sites "
                              f"({len(num)} columns) and their well-level means.")
-            if embed_rows:
-                edf = pd.DataFrame(embed_rows)
+            if net_embed_rows:
+                edf = pd.DataFrame(net_embed_rows)
                 edf.to_parquet(args.out_data_path.replace('.parquet', '_network_embeddings.parquet'),
                                engine='pyarrow')
-                # well level: mean over sites, per channel, elementwise
                 well_emb = (edf.groupby('Metadata_Well')['network_embedding']
-                              .apply(lambda s: np.mean(np.stack([np.asarray(v) for v in s]), axis=0).tolist())
+                              .apply(lambda t: np.mean(np.stack([np.asarray(v) for v in t]), axis=0).tolist())
                               .reset_index())
                 well_emb.to_parquet(
                     args.out_data_path.replace('.parquet', '_network_embeddings_well.parquet'),
